@@ -74,10 +74,11 @@ When `include_aeration_power` is true, airflow is selected in this order:
 
 1. explicit `Q_air`, if provided;
 2. `self.aeration.Q_air`, when the aeration object is `DiffusedAeration`.
+3. otherwise, `0.1 * V_max * 1440` in `m3/d`, corresponding to an airflow
+   rate of `0.1 m3/min` per `m3` of tank volume.
 
 Airflow is converted from `m3/d` to `m3/min` and passed to
-`qsdsan.utils.get_P_blower`. A clear error is raised if aeration power is
-enabled without either airflow source.
+`qsdsan.utils.get_P_blower`.
 
 ### Mechanical mixing
 
@@ -98,7 +99,6 @@ The class will reject:
   working-volume fraction;
 - negative freeboard, airflow, mixing intensity, or specific mixing power;
 - unsupported vessel types or vessel materials;
-- enabled aeration power without explicit airflow or `DiffusedAeration`.
 
 ## Source Comments
 
@@ -120,4 +120,5 @@ Focused tests will verify:
 - explicit-airflow aeration power;
 - `DiffusedAeration` airflow aeration power;
 - combined and disabled power selections;
-- validation when aeration airflow is unavailable.
+- default airflow based on tank volume when no other airflow source is
+  available.
