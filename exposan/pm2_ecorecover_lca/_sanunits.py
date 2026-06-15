@@ -11,19 +11,29 @@ This module is under the University of Illinois/NCSA Open Source License.
 Please refer to https://github.com/QSD-Group/EXPOsan/blob/main/LICENSE.txt
 for license details.
 """
+import biosteam as bst
 import os, numpy as np
 from qsdsan import SanUnit, Construction, WasteStream, System, unit_operations as su
 from qsdsan.unit_operations import WWTpump
 from qsdsan.unit_operations.bst._pumping import Pump
 from qsdsan import processes as pc
-from qsdsan.utils import auom, select_pipe, format_str
-from biosteam.units.design_tools import CEPCI_by_year
+from qsdsan.utils import auom, select_pipe, format_str, get_P_blower
+from biosteam.units.design_tools import (
+    CEPCI_by_year,
+    compute_number_of_tanks_and_purchase_cost,
+    mix_tank_purchase_cost_algorithms,
+    vessel_material_factors,
+)
+from biosteam.units.compressor import IsothermalCompressor
 from biosteam.units.decorators import cost
 from warnings import warn
 
 import math
 from math import pi, ceil
-__all__ = ('Photobioreactor'
+__all__ = ('Photobioreactor',
+           'Ecorecoverypump',
+           'Tank',
+           'CO2Supply',
            )
 #%%
 CSTR = su.CSTR
@@ -37,6 +47,551 @@ CEPCI_by_year.update({
     2024: 798.0,   # https://reg.lub.lu.se/luur/download?func=downloadFile&recordOId=9209157&fileOId=9209158
     2025: 811.0,   # estimated as 2024 * 1.016
 })
+
+class Tank(CSTR):
+    '''
+    Tank with design, BioSTEAM mixing-tank cost, and power estimation.
+
+    The process model, aeration behavior, and dynamic mass balances are inherited
+    from :class:`qsdsan.unit_operations.CSTR`. Tank geometry is reported for
+    reference, but concrete is not included in the purchase cost.
+
+    Parameters
+    ----------
+    V_wf : float
+        Working liquid volume divided by total tank volume.
+    vessel_type : str
+        BioSTEAM mixing-tank purchase-cost algorithm.
+    vessel_material : str
+        Tank construction material used by the BioSTEAM material factor.
+    include_aeration_power : bool
+        Whether to include blower power.
+    include_mixing_power : bool
+        Whether to include mechanical mixing power.
+    Q_air : float, optional
+        Field airflow in [m3/d]. If omitted, airflow is read from a
+        :class:`DiffusedAeration` object supplied through ``aeration``; if
+        neither is available, it defaults to ``0.1 * V_max * 1440``.
+    mixing_intensity : float, optional
+        Velocity-gradient mixing intensity, ``G``, in [1/s]. When supplied, it
+        takes precedence over ``kW_per_m3``.
+    kW_per_m3 : float
+        Specific mechanical mixing power in [kW/m3].
+    diffuser_unit_cost : float
+        Diffuser-grid cost in [USD/m2]. The default is zero as a placeholder
+        for a project-specific cost.
+    compressor_specific_mass : float
+        Stainless-steel compressor mass in [kg/kW]. The default is zero as a
+        placeholder for a project-specific mass correlation.
+    '''
+    _F_BM_default = {
+        'Tank': 2.3,
+        'Air compressor': 2.15,
+        'Diffusers': 1.,
+    }
+    _units = {
+        **CSTR._units,
+        'Tank volume': 'm3',
+        'Tank width': 'm',
+        'Tank depth': 'm',
+        'Tank length': 'm',
+        'Volume of concrete wall': 'm3',
+        'Volume of concrete slab': 'm3',
+        'Total volume': 'm3',
+        'Aeration power': 'kW',
+        'Mechanical mixing power': 'kW',
+        'Total power': 'kW',
+        'Air flow rate': 'm3/d',
+        'Air flow rate at compressor': 'cfm',
+        'Number of air compressors': '',
+        'Air compressor stainless steel': 'kg',
+        'Diffuser area': 'm2',
+        'Diffuser stainless steel': 'kg',
+    }
+    purchase_cost_algorithms = mix_tank_purchase_cost_algorithms
+
+    def __init__(self, ID='', ins=None, outs=(), thermo=None,
+                 init_with='WasteStream', split=None, V_max=1000,
+                 W_tank=6.4, D_tank=3.65, freeboard=0.61,
+                 t_wall=None, t_slab=None, aeration=2.0, DO_ID='S_O2',
+                 suspended_growth_model=None, gas_stripping=False,
+                 gas_IDs=None, stripping_kLa_min=None, K_Henry=None,
+                 D_gas=None, p_gas_atm=None, isdynamic=True,
+                 exogenous_vars=(), V_wf=0.8,
+                 vessel_type='Conventional',
+                 vessel_material='Stainless steel',
+                 include_aeration_power=False,
+                 include_mixing_power=True, Q_air=None,
+                 mixing_intensity=None, kW_per_m3=0.0985,
+                 blower_T=20, P_atm=101.325, P_inlet_loss=1,
+                 P_diffuser_loss=7, h_submergance=5.18,
+                 blower_efficiency=0.7, blower_K=0.283,
+                 diffuser_unit_cost=0., compressor_specific_mass=0.,
+                 **kwargs):
+        CSTR.__init__(
+            self, ID=ID, ins=ins, outs=outs, split=split, thermo=thermo,
+            init_with=init_with, V_max=V_max, W_tank=W_tank,
+            D_tank=D_tank, freeboard=freeboard, t_wall=t_wall,
+            t_slab=t_slab, aeration=aeration, DO_ID=DO_ID,
+            suspended_growth_model=suspended_growth_model,
+            gas_stripping=gas_stripping, gas_IDs=gas_IDs,
+            stripping_kLa_min=stripping_kLa_min, K_Henry=K_Henry,
+            D_gas=D_gas, p_gas_atm=p_gas_atm, isdynamic=isdynamic,
+            exogenous_vars=exogenous_vars, **kwargs,
+        )
+        self.W_tank = W_tank
+        self.D_tank = D_tank
+        self.freeboard = freeboard
+        self.t_wall = t_wall
+        self.t_slab = t_slab
+        self.V_wf = V_wf
+        self.vessel_type = vessel_type
+        self.vessel_material = vessel_material
+        self.include_aeration_power = bool(include_aeration_power)
+        self.include_mixing_power = bool(include_mixing_power)
+        self.Q_air = Q_air
+        self.mixing_intensity = mixing_intensity
+        self.kW_per_m3 = kW_per_m3
+        self.blower_T = blower_T
+        self.P_atm = P_atm
+        self.P_inlet_loss = P_inlet_loss
+        self.P_diffuser_loss = P_diffuser_loss
+        self.h_submergance = h_submergance
+        self.blower_efficiency = blower_efficiency
+        self.blower_K = blower_K
+        self.diffuser_unit_cost = diffuser_unit_cost
+        self.compressor_specific_mass = compressor_specific_mass
+
+    @staticmethod
+    def _require_positive(name, value):
+        if value <= 0:
+            raise ValueError(f'`{name}` must be positive.')
+        return value
+
+    @staticmethod
+    def _require_nonnegative(name, value):
+        if value < 0:
+            raise ValueError(f'`{name}` must be non-negative.')
+        return value
+
+    @property
+    def W_tank(self):
+        return self._W_tank
+
+    @W_tank.setter
+    def W_tank(self, value):
+        self._W_tank = self._require_positive('W_tank', value)
+
+    @property
+    def D_tank(self):
+        return self._D_tank
+
+    @D_tank.setter
+    def D_tank(self, value):
+        self._D_tank = self._require_positive('D_tank', value)
+
+    @property
+    def freeboard(self):
+        return self._freeboard
+
+    @freeboard.setter
+    def freeboard(self, value):
+        self._freeboard = self._require_nonnegative('freeboard', value)
+
+    @property
+    def t_wall(self):
+        if self._t_wall is not None:
+            return self._t_wall
+        depth_ft = self.D_tank * m_to_feet
+        return 0.3048 + max(depth_ft - 12, 0) * 0.0254
+
+    @t_wall.setter
+    def t_wall(self, value):
+        self._t_wall = (
+            None if value is None
+            else self._require_positive('t_wall', value)
+        )
+
+    @property
+    def t_slab(self):
+        if self._t_slab is not None:
+            return self._t_slab
+        return self.t_wall + 0.0508
+
+    @t_slab.setter
+    def t_slab(self, value):
+        self._t_slab = (
+            None if value is None
+            else self._require_positive('t_slab', value)
+        )
+
+    @property
+    def V_wf(self):
+        return self._V_wf
+
+    @V_wf.setter
+    def V_wf(self, value):
+        value = self._require_positive('V_wf', value)
+        if value > 1:
+            raise ValueError('`V_wf` cannot exceed 1.')
+        self._V_wf = value
+
+    @property
+    def Q_air(self):
+        return self._Q_air
+
+    @Q_air.setter
+    def Q_air(self, value):
+        self._Q_air = (
+            None if value is None
+            else self._require_nonnegative('Q_air', value)
+        )
+
+    @property
+    def mixing_intensity(self):
+        return self._mixing_intensity
+
+    @mixing_intensity.setter
+    def mixing_intensity(self, value):
+        self._mixing_intensity = (
+            None if value is None
+            else self._require_nonnegative('mixing_intensity', value)
+        )
+
+    @property
+    def kW_per_m3(self):
+        return self._kW_per_m3
+
+    @kW_per_m3.setter
+    def kW_per_m3(self, value):
+        self._kW_per_m3 = self._require_nonnegative('kW_per_m3', value)
+
+    @property
+    def diffuser_unit_cost(self):
+        return self._diffuser_unit_cost
+
+    @diffuser_unit_cost.setter
+    def diffuser_unit_cost(self, value):
+        self._diffuser_unit_cost = self._require_nonnegative(
+            'diffuser_unit_cost', value,
+        )
+
+    @property
+    def compressor_specific_mass(self):
+        return self._compressor_specific_mass
+
+    @compressor_specific_mass.setter
+    def compressor_specific_mass(self, value):
+        self._compressor_specific_mass = self._require_nonnegative(
+            'compressor_specific_mass', value,
+        )
+
+    @property
+    def vessel_type(self):
+        return self._vessel_type
+
+    @vessel_type.setter
+    def vessel_type(self, value):
+        try:
+            algorithm = self.purchase_cost_algorithms[value]
+        except KeyError:
+            valid = ', '.join(self.purchase_cost_algorithms)
+            raise ValueError(
+                f'`vessel_type` must be one of: {valid}.'
+            ) from None
+        self._vessel_type = value
+        self.purchase_cost_algorithm = algorithm
+
+    @property
+    def vessel_material(self):
+        return self._vessel_material
+
+    @vessel_material.setter
+    def vessel_material(self, value):
+        try:
+            factor = vessel_material_factors[value]
+        except KeyError:
+            valid = ', '.join(vessel_material_factors)
+            raise ValueError(
+                f'No vessel material factor is available for {value!r}; '
+                f'choose one of: {valid}.'
+            ) from None
+        self._vessel_material = value
+        self.F_M['Tank'] = factor
+
+    def _design(self):
+        D = self.design_results
+        V = self.V_max
+        W = self.W_tank
+        depth = self.D_tank
+        L = V / (W * depth)
+        t_wall = self.t_wall
+        t_slab = self.t_slab
+        total_depth = depth + self.freeboard
+
+        # Source: geometry in the commented QSDsan dynamic CSTR._design.
+        D['Tank volume'] = V
+        D['Tank width'] = W
+        D['Tank depth'] = depth
+        D['Tank length'] = L
+        D['Volume of concrete wall'] = (
+            2 * (L + 2 * t_wall) * t_wall * total_depth
+            + 2 * W * t_wall * total_depth
+        )
+        D['Volume of concrete slab'] = (
+            (L + 2 * t_wall) * (W + 2 * t_wall) * t_slab
+        )
+        D['Total volume'] = V / self.V_wf
+
+        if self.include_aeration_power:
+            Q_air = self._get_Q_air()
+            Q_air_acfm = auom('m3/d').convert(Q_air, 'cfm')
+            aeration_power = self._get_aeration_power()
+            compressor_algorithm = (
+                IsothermalCompressor.baseline_cost_algorithms['Screw']
+            )
+            max_acfm = compressor_algorithm.acfm_bounds[1]
+            N_compressors = (
+                ceil(Q_air_acfm / max_acfm) if Q_air_acfm > 0 else 0
+            )
+            # Source: full-floor diffuser coverage specified for this model.
+            diffuser_area = W * L
+        else:
+            Q_air = Q_air_acfm = aeration_power = 0.
+            N_compressors = 0
+            diffuser_area = 0.
+
+        # Source: maximum ACFM from BioSTEAM's screw-compressor algorithm.
+        D['Air flow rate'] = Q_air
+        D['Air flow rate at compressor'] = Q_air_acfm
+        D['Number of air compressors'] = N_compressors
+        D['Air compressor stainless steel'] = (
+            aeration_power * self.compressor_specific_mass
+        ) #kg/kW
+        D['Diffuser area'] = diffuser_area #m2
+        D['Diffuser stainless steel'] = diffuser_area * 181 / 18.5 #kg
+
+    def _get_Q_air(self):
+        Q_air = self.Q_air
+        if Q_air is None and isinstance(self.aeration, pc.DiffusedAeration):
+            Q_air = self.aeration.Q_air
+        if Q_air is None:
+            # Default: 0.1 m3 air/(m3 tank*min), converted here to m3/d.
+            Q_air = 0.1 * self.V_max * 1440
+        return Q_air
+
+    def _get_aeration_power(self):
+        if not self.include_aeration_power:
+            return 0.
+        Q_air = self._get_Q_air()
+
+        # Source: QSDsan wwt_design.get_P_blower; it expects airflow in m3/min.
+        return get_P_blower(
+            Q_air / 1440,
+            T=self.blower_T,
+            P_atm=self.P_atm,
+            P_inlet_loss=self.P_inlet_loss,
+            P_diffuser_loss=self.P_diffuser_loss,
+            h_submergance=self.h_submergance,
+            efficiency=self.blower_efficiency,
+            K=self.blower_K,
+        )
+
+    def _get_mixing_power(self):
+        if not self.include_mixing_power:
+            return 0.
+        if self.mixing_intensity is None:
+            return self.kW_per_m3 * self.V_max
+
+        # Source: QSDsan static Reactor.kW_per_m3 (P/V = mu*G^2/1000).
+        self._mixed.mix_from(self.ins)
+        specific_power = self._mixed.mu * self.mixing_intensity**2 / 1000
+        return specific_power * self.V_max
+
+    def _cost(self):
+        D = self.design_results
+        C = self.baseline_purchase_costs
+
+        # Source: BioSTEAM Tank._cost used by BioSTEAM MixTank.
+        N, Cp = compute_number_of_tanks_and_purchase_cost(
+            D['Total volume'], self.purchase_cost_algorithm,
+        )
+        if not N:
+            C.clear()
+            self.parallel.pop('self', None)
+            self.power_utility.rate = 0.
+            return
+
+        self.parallel['self'] = N
+        default_material = self.purchase_cost_algorithm.material
+        C['Tank'] = Cp / vessel_material_factors.get(default_material, 1.)
+
+        aeration_power = self._get_aeration_power()
+        mixing_power = self._get_mixing_power()
+        total_power = aeration_power + mixing_power
+        D['Aeration power'] = aeration_power
+        D['Mechanical mixing power'] = mixing_power
+        D['Total power'] = total_power
+
+        if self.include_aeration_power:
+            N_compressors = D['Number of air compressors']
+            if N_compressors and aeration_power > 0:
+                algorithm = (
+                    IsothermalCompressor.baseline_cost_algorithms['Screw']
+                )
+                total_hp = auom('kW').convert(aeration_power, 'hp')
+                hp_per_compressor = total_hp / N_compressors
+                compressor_cost = (
+                    N_compressors * CEPCI_by_year[2022] / algorithm.CE #assume basis year is 2022
+                    * algorithm.cost(hp_per_compressor)
+                )
+            else:
+                compressor_cost = 0.
+
+            # BioSTEAM later scales all entries by parallel['self'].
+            C['Air compressor'] = compressor_cost / N
+            C['Diffusers'] = (
+                D['Diffuser area'] * self.diffuser_unit_cost / N
+            )
+            self.F_M['Air compressor'] = 2.5
+        else:
+            C.pop('Air compressor', None)
+            C.pop('Diffusers', None)
+
+        # BioSTEAM scales utilities by parallel['self'] after _cost().
+        self.power_utility.rate = total_power / N
+
+
+class CO2Supply(SanUnit):
+    '''
+    Pass-through unit that estimates purchased CO2 makeup and operating cost.
+
+    The influent is copied to the effluent without adding CO2 to the process
+    mass balance. Supply is estimated from the difference between a target and
+    influent dissolved-CO2 concentration.
+
+    Parameters
+    ----------
+    target_CO2 : float
+        Target dissolved-CO2 concentration in [mg/L].
+    excess_fraction : float
+        Fractional allowance for unmodeled CO2 losses.
+    CO2_ID : str
+        Component ID representing dissolved CO2.
+    CO2_price : float
+        CO2 price in 2016 [USD/metric tonne].
+    '''
+    _N_ins = 1
+    _N_outs = 1
+    _units = {
+        'Influent CO2 concentration': 'mg/L',
+        'Target CO2 concentration': 'mg/L',
+        'Wastewater flow': 'L/hr',
+        'Base CO2 makeup': 'kg/hr',
+        'CO2 supply': 'kg/hr',
+        'Excess CO2 fraction': '',
+    }
+
+    def __init__(
+            self, ID='', ins=None, outs=(), thermo=None,
+            init_with='WasteStream', target_CO2=30.,
+            excess_fraction=0.10, CO2_ID='S_CO2',
+            CO2_price=45.,
+        ):
+        SanUnit.__init__(
+            self, ID=ID, ins=ins, outs=outs, thermo=thermo,
+            init_with=init_with,
+        )
+        self.target_CO2 = target_CO2
+        self.excess_fraction = excess_fraction
+        self.CO2_ID = CO2_ID
+        self.CO2_price = CO2_price
+
+    @staticmethod
+    def _require_nonnegative(name, value):
+        if value < 0:
+            raise ValueError(f'`{name}` must be non-negative.')
+        return value
+
+    @property
+    def target_CO2(self):
+        return self._target_CO2
+
+    @target_CO2.setter
+    def target_CO2(self, value):
+        self._target_CO2 = self._require_nonnegative('target_CO2', value)
+
+    @property
+    def excess_fraction(self):
+        return self._excess_fraction
+
+    @excess_fraction.setter
+    def excess_fraction(self, value):
+        self._excess_fraction = self._require_nonnegative(
+            'excess_fraction', value,
+        )
+
+    @property
+    def CO2_ID(self):
+        return self._CO2_ID
+
+    @CO2_ID.setter
+    def CO2_ID(self, value):
+        if value not in self.components.IDs:
+            raise ValueError(
+                f'`CO2_ID` must be one of the unit components; '
+                f'received {value!r}.'
+            )
+        self._CO2_ID = value
+
+    @property
+    def CO2_price(self):
+        return self._CO2_price
+
+    @CO2_price.setter
+    def CO2_price(self, value):
+        self._CO2_price = self._require_nonnegative('CO2_price', value)
+
+    def _run(self):
+        # Source: QSDsan Copier; this unit does not alter the mass balance.
+        self.outs[0].copy_like(self.ins[0])
+
+    def _design(self):
+        D = self.design_results
+        influent = self.ins[0]
+        Q = influent.get_total_flow('L/hr')
+        if Q > 0:
+            C_in = float(
+                influent.get_mass_concentration(
+                    'mg/L', IDs=(self.CO2_ID,),
+                )[0]
+            )
+        else:
+            C_in = 0.
+
+        # mg/L * L/hr * 1e-6 = kg/hr.
+        base_makeup = max(self.target_CO2 - C_in, 0.) * Q * 1e-6
+        # User-settable allowance for unmodeled CO2 losses.
+        supply = base_makeup * (1 + self.excess_fraction)
+
+        D['Influent CO2 concentration'] = C_in
+        D['Target CO2 concentration'] = self.target_CO2
+        D['Wastewater flow'] = Q
+        D['Base CO2 makeup'] = base_makeup
+        D['CO2 supply'] = supply
+        D['Excess CO2 fraction'] = self.excess_fraction
+
+    def _cost(self):
+        # Convert 2016 USD/metric tonne to 2022 USD/kg.
+        price_2022 = (
+            self.CO2_price / 1000
+            * CEPCI_by_year[2022] / CEPCI_by_year[2016]
+        )
+        self.add_OPEX['CO2 supply'] = (
+            self.design_results['CO2 supply'] * price_2022
+        )
+
+
 @cost(basis = 'Aerial footage-volume-to-area ratio', ID='Glass tube & fittings', units='m3/m2',
       cost = 233240/acre_to_sq_m, S=0.029499829299047615, CE=CEPCI_by_year[2014], n=1, BM=1.1) #ref:https://docs.nrel.gov/docs/fy19osti/72716.pdf
 @cost(basis='Aerial footage', ID='Greenhouse',units='m2',cost= 13*sq_feet_to_sq_m, S=1, CE=CEPCI_by_year[1994], n=1, BM=1) #conventional greenhouse in ref page 38: https://blog.uvm.edu/cwcallah/files/2021/03/NRAES-33_Web.pdf
@@ -114,9 +669,20 @@ class Photobioreactor(CSTR):
     
     References
     ----------
-     [1] #TODO
+     [1] Shoener, B. D.; Zhong, C.; Greiner, A. D.; Khunjar, W. O.; Hong, P.-Y.; Guest, J. S.
+         Design of Anaerobic Membrane Bioreactors for the Valorization
+         of Dilute Organic Carbon Waste Streams.
+         Energy Environ. Sci. 2016, 9 (3), 1102-1112.
+         https://doi.org/10.1039/C5EE03715H.
     
     '''
+    _units = {
+        **CSTR._units,
+        'Aerial footage-volume-to-area ratio': 'm3/m2',
+        'Aerial footage': 'm2',
+        'Aerial footage-tube area per support area': 'm2',
+    }
+
     def __init__(self, ID='', ins=None, outs=(), thermo=None, init_with='WasteStream',
                 split=None,V_max=1000, W_tank = 6.4, D_tank = 3.65,
                 freeboard = 0.61, t_wall = None, t_slab = None, aeration=2.0, 
@@ -611,4 +1177,3 @@ class Ecorecoverypump(WWTpump):
         M_SS_pump = N_pump * self.SS_per_pump                       # [kg]
 
         return M_SS_pipe, M_SS_pump, 0.
-        

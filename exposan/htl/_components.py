@@ -120,6 +120,7 @@ def create_components(set_thermo=True):
                          formula='NH4MgPO4·H12O6', phase='s',
                          particle_size='Particulate', 
                          degradability='Undegradable',
+                         formula_override=True,
                          organic=False)
     add_V_from_rho(Struvite, 1710)
     # http://webmineral.com/data/Struvite.shtml#.YzYvqOzMIiM
