@@ -5,7 +5,8 @@
 Add a `Tank` sanitation unit to `exposan.pm2_ecorecover_lca._sanunits` that
 retains the dynamic behavior and initialization interface of QSDsan's `CSTR`
 while adding tank geometry, BioSTEAM `MixTank` purchase cost, and configurable
-aeration and mechanical-mixing electricity.
+aeration and mechanical-mixing electricity. When aeration power is enabled, the
+tank will also include screw-compressor and diffuser design and purchase cost.
 
 The existing `MIX = su.CSTR(...)` definition in `ecorecover_lca.py` will not be
 changed.
@@ -27,6 +28,10 @@ It will add:
 - `include_aeration_power` and `include_mixing_power`;
 - `Q_air`: optional explicit field airflow in `m3/d`;
 - blower parameters accepted by `qsdsan.utils.get_P_blower`;
+- `diffuser_unit_cost`: user-supplied diffuser-grid cost in `USD/m2`, defaulting
+  to zero as an explicit placeholder;
+- `compressor_specific_mass`: user-supplied stainless-steel compressor mass in
+  `kg/kW`, defaulting to zero as an explicit placeholder;
 - `mixing_intensity`: optional velocity gradient `G` in `1/s`;
 - `kW_per_m3`: specific mechanical-mixing power when `G` is absent.
 
@@ -51,6 +56,35 @@ The design results will also include the total volume passed to the BioSTEAM
 cost algorithm. The correlation volume is `V_max / V_wf`, treating `V_max` as
 working liquid volume.
 
+### Aeration equipment
+
+Compressor and diffuser design is included only when
+`include_aeration_power=True`.
+
+The resolved airflow is converted from `m3/d` to actual cubic feet per minute.
+The system-total number of parallel screw compressors is:
+
+`ceil(Q_air_acfm / 20,000)`
+
+following the maximum ACFM bound of BioSTEAM's screw-compressor cost algorithm.
+Aeration power from `_get_aeration_power()` is treated as total compressor
+driver power. Compressor stainless-steel mass is:
+
+`aeration_power * compressor_specific_mass`
+
+The default `compressor_specific_mass=0 kg/kW` is a documented placeholder
+because no defensible general power-to-mass correlation was identified.
+
+The diffuser grid is assumed to cover the full horizontal tank area:
+
+`diffuser_area = W_tank * tank_length`
+
+Its stainless-steel mass is:
+
+`diffuser_area * 181 / 18.5`
+
+where `181 / 18.5` has units of `kg/m2`, as specified for this model.
+
 ## Cost
 
 The `_cost()` method will follow BioSTEAM's `MixTank` cost algorithm:
@@ -64,6 +98,43 @@ The `_cost()` method will follow BioSTEAM's `MixTank` cost algorithm:
 BioSTEAM's built-in fixed mixing-power assignment will not be used, because
 power is calculated independently as described below.
 
+When `include_aeration_power=True`, compressor purchase cost follows
+BioSTEAM's `IsothermalCompressor` screw-compressor algorithm with an electric
+motor:
+
+`exp(8.2496 + 0.7243 * log(Pc))`
+
+where `Pc` is driver power per compressor in hp. Total aeration power from
+`_get_aeration_power()` is divided among the parallel compressors before
+applying the correlation, and individual costs are summed. The cost is adjusted
+from correlation CEPCI 567 to the current BioSTEAM CEPCI. A stainless-steel
+material factor of 2.5 and bare-module factor of 2.15 are assigned to the
+compressor cost entry.
+
+The calculated compressor and diffuser costs are system totals. Because
+BioSTEAM later multiplies all purchase-cost entries by `parallel['self']`, the
+values stored in `baseline_purchase_costs` are divided by the number of
+parallel tanks. This preserves the intended system-total aeration-equipment
+cost.
+
+If resolved airflow or aeration power is zero, compressor count and cost are
+zero and the logarithmic cost correlation is not evaluated.
+
+Because `_get_aeration_power()` already returns electrical power after blower
+efficiency, no additional electric-motor efficiency adjustment is applied
+during cost sizing.
+
+Diffuser purchase cost is:
+
+`diffuser_area * diffuser_unit_cost`
+
+The default `diffuser_unit_cost=0 USD/m2` is a documented placeholder. Users
+can supply a project-specific value without changing the cost method.
+
+When aeration power is disabled, compressor and diffuser costs are omitted and
+their aeration-specific design quantities are zero. No QSDsan `Construction`
+objects are created for either item.
+
 ## Electricity
 
 Aeration and mixing power are independently selectable and additive.
@@ -73,7 +144,7 @@ Aeration and mixing power are independently selectable and additive.
 When `include_aeration_power` is true, airflow is selected in this order:
 
 1. explicit `Q_air`, if provided;
-2. `self.aeration.Q_air`, when the aeration object is `DiffusedAeration`.
+2. `self.aeration.Q_air`, when the aeration object is `DiffusedAeration`;
 3. otherwise, `0.1 * V_max * 1440` in `m3/d`, corresponding to an airflow
    rate of `0.1 m3/min` per `m3` of tank volume.
 
@@ -98,7 +169,8 @@ The class will reject:
 - nonpositive tank width, liquid depth, wall thickness, slab thickness, and
   working-volume fraction;
 - negative freeboard, airflow, mixing intensity, or specific mixing power;
-- unsupported vessel types or vessel materials;
+- negative diffuser unit cost or compressor specific mass;
+- unsupported vessel types or vessel materials.
 
 ## Source Comments
 
@@ -107,6 +179,10 @@ Short comments will identify the origin of each borrowed calculation:
 - tank geometry: commented QSDsan dynamic `CSTR` design;
 - purchase cost: BioSTEAM `MixTank`/`Tank`;
 - aeration power: QSDsan `get_P_blower`;
+- compressor sizing and purchase cost: BioSTEAM `Compressor`/
+  `IsothermalCompressor` screw algorithm;
+- diffuser area and mass: full-floor coverage assumption and the user-specified
+  `181/18.5 kg/m2` factor;
 - mixing power: QSDsan static `Reactor`.
 
 ## Tests
@@ -121,4 +197,9 @@ Focused tests will verify:
 - `DiffusedAeration` airflow aeration power;
 - combined and disabled power selections;
 - default airflow based on tank volume when no other airflow source is
-  available.
+  available;
+- parallel compressor count from airflow;
+- screw-compressor purchase cost and stainless-steel material factor;
+- user-settable compressor specific mass;
+- diffuser horizontal area, stainless-steel mass, and user-settable unit cost;
+- omission of compressor and diffuser costs when aeration power is disabled.
