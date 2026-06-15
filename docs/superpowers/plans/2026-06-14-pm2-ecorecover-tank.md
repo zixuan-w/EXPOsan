@@ -2,13 +2,327 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a dynamic `Tank(CSTR)` sanitation unit with rectangular-tank design results, BioSTEAM `MixTank` equipment cost, and independently selectable aeration and mechanical-mixing electricity.
+**Goal:** Add a dynamic `Tank(CSTR)` sanitation unit with rectangular-tank design results, BioSTEAM `MixTank` equipment cost, independently selectable aeration and mechanical-mixing electricity, and aeration-equipment design and cost.
 
-**Architecture:** Keep process dynamics entirely in the inherited QSDsan `CSTR`. Add only design, purchase-cost, validation, and utility accounting in the EXPOsan subclass. Reuse BioSTEAM's public tank cost data/functions and QSDsan's public blower helper instead of duplicating their equations.
+**Architecture:** Keep process dynamics entirely in the inherited QSDsan `CSTR`. Add only design, purchase-cost, validation, and utility accounting in the EXPOsan subclass. Reuse BioSTEAM's public tank and screw-compressor cost algorithms and QSDsan's public blower helper instead of duplicating their equations.
 
-**Tech Stack:** Python, QSDsan dynamic `CSTR`, BioSTEAM tank cost algorithms, pytest.
+**Tech Stack:** Python, QSDsan dynamic `CSTR`, BioSTEAM tank and compressor cost algorithms, pytest.
 
 ---
+
+### Amendment: Add air compressor and diffuser equipment
+
+**Files:**
+- Modify: `tests/test_pm2_ecorecover_lca.py`
+- Modify: `exposan/pm2_ecorecover_lca/_sanunits.py`
+
+- [ ] **Step 1: Add imports used to calculate expected compressor results**
+
+Add these imports to `tests/test_pm2_ecorecover_lca.py`:
+
+```python
+import biosteam as bst
+
+from biosteam.units.compressor import IsothermalCompressor
+from qsdsan.utils import auom, get_P_blower
+```
+
+Keep the existing QSDsan and EXPOsan imports.
+
+- [ ] **Step 2: Add a failing enabled-equipment design and cost test**
+
+```python
+def test_tank_adds_aeration_equipment_when_enabled(tank):
+    tank.include_aeration_power = True
+    tank.Q_air = 1440
+    tank.diffuser_unit_cost = 12
+    tank.compressor_specific_mass = 5
+    tank.simulate()
+
+    D = tank.design_results
+    N_tanks = tank.parallel['self']
+    power = get_P_blower(1)
+    hp = auom('kW').convert(power, 'hp')
+    algorithm = IsothermalCompressor.baseline_cost_algorithms['Screw']
+    expected_compressor_cost = bst.CE / algorithm.CE * algorithm.cost(hp)
+    expected_area = tank.W_tank * D['Tank length']
+
+    assert D['Air flow rate'] == pytest.approx(1440)
+    assert D['Air flow rate at compressor'] == pytest.approx(
+        auom('m3/d').convert(1440, 'cfm')
+    )
+    assert D['Number of air compressors'] == 1
+    assert D['Air compressor stainless steel'] == pytest.approx(power * 5)
+    assert D['Diffuser area'] == pytest.approx(expected_area)
+    assert D['Diffuser stainless steel'] == pytest.approx(
+        expected_area * 181 / 18.5
+    )
+    assert (
+        tank.baseline_purchase_costs['Air compressor'] * N_tanks
+        == pytest.approx(expected_compressor_cost)
+    )
+    assert (
+        tank.baseline_purchase_costs['Diffusers'] * N_tanks
+        == pytest.approx(expected_area * 12)
+    )
+    assert tank.F_M['Air compressor'] == pytest.approx(2.5)
+    assert tank.F_BM['Air compressor'] == pytest.approx(2.15)
+```
+
+- [ ] **Step 3: Add failing parallel, disabled, and validation tests**
+
+```python
+def test_tank_sizes_parallel_air_compressors(tank):
+    tank.include_aeration_power = True
+    tank.Q_air = auom('cfm').convert(40001, 'm3/d')
+    tank.simulate()
+    assert tank.design_results['Number of air compressors'] == 3
+
+
+def test_tank_omits_aeration_equipment_when_disabled(tank):
+    tank.diffuser_unit_cost = 12
+    tank.compressor_specific_mass = 5
+    tank.simulate()
+    D = tank.design_results
+    assert D['Number of air compressors'] == 0
+    assert D['Air compressor stainless steel'] == 0
+    assert D['Diffuser area'] == 0
+    assert D['Diffuser stainless steel'] == 0
+    assert 'Air compressor' not in tank.baseline_purchase_costs
+    assert 'Diffusers' not in tank.baseline_purchase_costs
+
+
+def test_tank_handles_zero_airflow_without_compressor_cost(tank):
+    tank.include_aeration_power = True
+    tank.Q_air = 0
+    tank.simulate()
+    assert tank.design_results['Number of air compressors'] == 0
+    assert tank.baseline_purchase_costs['Air compressor'] == 0
+
+
+@pytest.mark.parametrize(
+    'name',
+    ('diffuser_unit_cost', 'compressor_specific_mass'),
+)
+def test_tank_rejects_negative_aeration_equipment_factors(tank, name):
+    with pytest.raises(ValueError, match=name):
+        setattr(tank, name, -1)
+```
+
+- [ ] **Step 4: Run the new tests and verify RED**
+
+Run:
+
+```bash
+NUMBA_CACHE_DIR=/tmp/numba-cache MPLCONFIGDIR=/tmp/algae-mpl \
+  /opt/anaconda3/envs/algae/bin/python -m pytest \
+  tests/test_pm2_ecorecover_lca.py::test_tank_adds_aeration_equipment_when_enabled \
+  tests/test_pm2_ecorecover_lca.py::test_tank_sizes_parallel_air_compressors \
+  tests/test_pm2_ecorecover_lca.py::test_tank_omits_aeration_equipment_when_disabled \
+  tests/test_pm2_ecorecover_lca.py::test_tank_handles_zero_airflow_without_compressor_cost \
+  tests/test_pm2_ecorecover_lca.py::test_tank_rejects_negative_aeration_equipment_factors \
+  -q
+```
+
+Expected: FAIL because the constructor parameters, design-result keys, and
+aeration-equipment costs do not exist yet.
+
+- [ ] **Step 5: Add BioSTEAM compressor imports and design-result units**
+
+In `exposan/pm2_ecorecover_lca/_sanunits.py`, add:
+
+```python
+import biosteam as bst
+
+from biosteam.units.compressor import IsothermalCompressor
+```
+
+Extend `Tank._units` with:
+
+```python
+'Air flow rate': 'm3/d',
+'Air flow rate at compressor': 'cfm',
+'Number of air compressors': '',
+'Air compressor stainless steel': 'kg',
+'Diffuser area': 'm2',
+'Diffuser stainless steel': 'kg',
+```
+
+Extend the class-level bare-module defaults:
+
+```python
+_F_BM_default = {
+    'Tank': 2.3,
+    'Air compressor': 2.15,
+    'Diffusers': 1.0,
+}
+```
+
+- [ ] **Step 6: Add and validate the user-settable placeholder factors**
+
+Add constructor parameters:
+
+```python
+diffuser_unit_cost=0.,
+compressor_specific_mass=0.,
+```
+
+Assign them through validated properties:
+
+```python
+@property
+def diffuser_unit_cost(self):
+    return self._diffuser_unit_cost
+
+@diffuser_unit_cost.setter
+def diffuser_unit_cost(self, value):
+    self._diffuser_unit_cost = self._require_nonnegative(
+        'diffuser_unit_cost', value,
+    )
+
+@property
+def compressor_specific_mass(self):
+    return self._compressor_specific_mass
+
+@compressor_specific_mass.setter
+def compressor_specific_mass(self, value):
+    self._compressor_specific_mass = self._require_nonnegative(
+        'compressor_specific_mass', value,
+    )
+```
+
+Document both zero defaults as placeholders in the class docstring.
+
+- [ ] **Step 7: Centralize airflow resolution**
+
+Add:
+
+```python
+def _get_Q_air(self):
+    Q_air = self.Q_air
+    if Q_air is None and isinstance(self.aeration, pc.DiffusedAeration):
+        Q_air = self.aeration.Q_air
+    if Q_air is None:
+        Q_air = 0.1 * self.V_max * 1440
+    return Q_air
+```
+
+Change `_get_aeration_power()` to call `_get_Q_air()` and retain the existing
+`m3/d` to `m3/min` conversion passed to `get_P_blower`.
+
+- [ ] **Step 8: Add compressor and diffuser design**
+
+At the end of `_design()`, add:
+
+```python
+if self.include_aeration_power:
+    Q_air = self._get_Q_air()
+    Q_air_acfm = auom('m3/d').convert(Q_air, 'cfm')
+    aeration_power = self._get_aeration_power()
+    compressor_algorithm = (
+        IsothermalCompressor.baseline_cost_algorithms['Screw']
+    )
+    max_acfm = compressor_algorithm.acfm_bounds[1]
+    N_compressors = ceil(Q_air_acfm / max_acfm) if Q_air_acfm > 0 else 0
+    diffuser_area = W * L
+else:
+    Q_air = Q_air_acfm = aeration_power = 0.
+    N_compressors = 0
+    diffuser_area = 0.
+
+D['Air flow rate'] = Q_air
+D['Air flow rate at compressor'] = Q_air_acfm
+D['Number of air compressors'] = N_compressors
+D['Air compressor stainless steel'] = (
+    aeration_power * self.compressor_specific_mass
+)
+D['Diffuser area'] = diffuser_area
+D['Diffuser stainless steel'] = diffuser_area * 181 / 18.5
+```
+
+Add source comments for BioSTEAM's screw-compressor ACFM bound and the specified
+full-floor diffuser assumption.
+
+- [ ] **Step 9: Calculate power once, then add equipment purchase cost**
+
+After the Tank cost and after `N = self.parallel['self']` is known, calculate
+and record the power terms before aeration-equipment cost:
+
+```python
+aeration_power = self._get_aeration_power()
+mixing_power = self._get_mixing_power()
+total_power = aeration_power + mixing_power
+D['Aeration power'] = aeration_power
+D['Mechanical mixing power'] = mixing_power
+D['Total power'] = total_power
+```
+
+Reuse the local `aeration_power` in the compressor cost:
+
+```python
+if self.include_aeration_power:
+    N_compressors = D['Number of air compressors']
+    if N_compressors and aeration_power > 0:
+        algorithm = IsothermalCompressor.baseline_cost_algorithms['Screw']
+        total_hp = auom('kW').convert(aeration_power, 'hp')
+        hp_per_compressor = total_hp / N_compressors
+        compressor_cost = (
+            N_compressors * bst.CE / algorithm.CE
+            * algorithm.cost(hp_per_compressor)
+        )
+    else:
+        compressor_cost = 0.
+
+    C['Air compressor'] = compressor_cost / N
+    C['Diffusers'] = (
+        D['Diffuser area'] * self.diffuser_unit_cost / N
+    )
+    self.F_M['Air compressor'] = 2.5
+else:
+    C.pop('Air compressor', None)
+    C.pop('Diffusers', None)
+
+self.power_utility.rate = total_power / N
+```
+
+The division by `N` is required because BioSTEAM later multiplies every
+purchase-cost entry by `parallel['self']`. Add a source comment identifying the
+BioSTEAM `IsothermalCompressor` screw correlation. Do not apply another motor
+efficiency because `_get_aeration_power()` already returns electrical power.
+Remove the old duplicate power calculation from the end of `_cost()`.
+
+- [ ] **Step 10: Run the focused aeration-equipment tests and verify GREEN**
+
+Run the command from Step 4.
+
+Expected: all selected tests pass.
+
+- [ ] **Step 11: Run the complete Tank and adjacent regression tests**
+
+Run:
+
+```bash
+NUMBA_CACHE_DIR=/tmp/numba-cache MPLCONFIGDIR=/tmp/algae-mpl \
+  /opt/anaconda3/envs/algae/bin/python -m pytest \
+  tests/test_pm2_ecorecover_lca.py tests/test_pm2.py \
+  tests/test_module_conventions.py -q
+```
+
+Expected: all tests pass.
+
+- [ ] **Step 12: Review the final implementation diff**
+
+Confirm:
+
+- `ecorecover_lca.py` is unchanged;
+- compressor and diffuser equipment appears only when
+  `include_aeration_power=True`;
+- existing Tank power is not added a second time;
+- system-total compressor and diffuser cost is not multiplied twice by
+  `parallel['self']`;
+- `diffuser_unit_cost` and `compressor_specific_mass` remain explicit
+  zero-default placeholders;
+- no QSDsan `Construction` objects are added.
 
 ### Amendment: Default aeration airflow
 
