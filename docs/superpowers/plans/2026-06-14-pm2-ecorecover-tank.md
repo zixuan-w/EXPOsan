@@ -10,6 +10,68 @@
 
 ---
 
+### Amendment: Default aeration airflow
+
+**Files:**
+- Modify: `tests/test_pm2_ecorecover_lca.py`
+- Modify: `exposan/pm2_ecorecover_lca/_sanunits.py`
+
+- [ ] **Step 1: Replace the missing-airflow error test with a fallback test**
+
+```python
+def test_tank_defaults_airflow_from_tank_volume(tank):
+    tank.include_aeration_power = True
+    tank.simulate()
+    expected_Q_air = 0.1 * tank.V_max * 1440
+    assert tank.design_results['Aeration power'] == pytest.approx(
+        get_P_blower(expected_Q_air / 1440)
+    )
+```
+
+- [ ] **Step 2: Run the fallback test and verify RED**
+
+Run:
+
+```bash
+NUMBA_CACHE_DIR=/tmp/numba-cache MPLCONFIGDIR=/tmp/algae-mpl \
+  /opt/anaconda3/envs/algae/bin/python -m pytest \
+  tests/test_pm2_ecorecover_lca.py::test_tank_defaults_airflow_from_tank_volume -q
+```
+
+Expected: FAIL because `_get_aeration_power()` still raises `ValueError` when
+neither explicit `Q_air` nor `DiffusedAeration.Q_air` is available.
+
+- [ ] **Step 3: Implement the default airflow**
+
+After checking explicit and `DiffusedAeration` airflow, add:
+
+```python
+if Q_air is None:
+    Q_air = 0.1 * self.V_max * 1440
+```
+
+Keep the existing conversion from `m3/d` to `m3/min` when calling
+`get_P_blower`.
+
+- [ ] **Step 4: Run the focused test and verify GREEN**
+
+Run the command from Step 2.
+
+Expected: PASS.
+
+- [ ] **Step 5: Run the Tank and regression tests**
+
+Run:
+
+```bash
+NUMBA_CACHE_DIR=/tmp/numba-cache MPLCONFIGDIR=/tmp/algae-mpl \
+  /opt/anaconda3/envs/algae/bin/python -m pytest \
+  tests/test_pm2_ecorecover_lca.py tests/test_pm2.py \
+  tests/test_module_conventions.py -q
+```
+
+Expected: all tests pass.
+
 ### Task 1: Add focused Tank tests
 
 **Files:**
