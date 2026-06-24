@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import pytest
+import numpy as np
 
 from biosteam.units.compressor import IsothermalCompressor
 from biosteam.units.design_tools import CEPCI_by_year
@@ -9,7 +10,9 @@ from qsdsan import WasteStream
 from qsdsan import process_models as pc
 from qsdsan.utils import auom, get_P_blower
 
-from exposan.pm2_ecorecover_lca._sanunits import CO2Supply, Tank
+from exposan.pm2_ecorecover_lca._sanunits import (
+    AlgaeCentrifuge, CO2Supply, Tank, Ultrafiltration,
+)
 
 
 @pytest.fixture
@@ -47,6 +50,34 @@ def co2_supply():
         'CO2_test',
         ins=feed,
         outs='co2_supply_effluent',
+    )
+
+
+@pytest.fixture
+def ultrafiltration():
+    pc.create_pm2_cmps()
+    feed = WasteStream('uf_feed', H2O=1000, units='kg/hr')
+    return Ultrafiltration(
+        'UF_test',
+        ins=feed,
+        outs=('uf_permeate', 'uf_retentate'),
+        split=0.4,
+        R_t=1e14,
+        T=25,
+        TMP=2e5,
+        capacity_factor=1.5,
+    )
+
+
+@pytest.fixture
+def algae_centrifuge():
+    pc.create_pm2_cmps()
+    feed = WasteStream('centrifuge_feed', H2O=10000, units='kg/hr')
+    return AlgaeCentrifuge(
+        'CENT_test',
+        ins=feed,
+        outs=('centrate', 'algae_slurry'),
+        split=0.4,
     )
 
 
@@ -133,8 +164,8 @@ def test_tank_defaults_airflow_from_tank_volume(tank):
 def test_tank_adds_aeration_equipment_when_enabled(tank):
     tank.include_aeration_power = True
     tank.Q_air = 1440
+    tank.unit_diffuser_flow_rate = 100
     tank.diffuser_unit_cost = 12
-    tank.compressor_specific_mass = 5
     tank.simulate()
 
     D = tank.design_results
@@ -145,13 +176,18 @@ def test_tank_adds_aeration_equipment_when_enabled(tank):
         CEPCI_by_year[2022] / algorithm.CE * algorithm.cost(hp)
     )
     expected_area = tank.W_tank * D['Tank length']
+    expected_diffusers = 15
+    expected_compressor_mass = 16.013 * hp + 75.813
 
     assert D['Air flow rate'] == pytest.approx(1440)
     assert D['Air flow rate at compressor'] == pytest.approx(
         auom('m3/d').convert(1440, 'cfm')
     )
     assert D['Number of air compressors'] == 1
-    assert D['Air compressor stainless steel'] == pytest.approx(power * 5)
+    assert D['Number of diffusers'] == expected_diffusers
+    assert D['Air compressor carbon steel'] == pytest.approx(
+        expected_compressor_mass
+    )
     assert D['Diffuser area'] == pytest.approx(expected_area)
     assert D['Diffuser stainless steel'] == pytest.approx(
         expected_area * 181 / 18.5
@@ -160,7 +196,7 @@ def test_tank_adds_aeration_equipment_when_enabled(tank):
         expected_compressor_cost
     )
     assert tank.baseline_purchase_costs['Diffusers'] == pytest.approx(
-        expected_area * 12
+        expected_diffusers * 12
     )
     assert tank.F_M['Air compressor'] == pytest.approx(2.5)
     assert tank.F_BM['Air compressor'] == pytest.approx(2.15)
@@ -175,11 +211,11 @@ def test_tank_sizes_parallel_air_compressors(tank):
 
 def test_tank_omits_aeration_equipment_when_disabled(tank):
     tank.diffuser_unit_cost = 12
-    tank.compressor_specific_mass = 5
     tank.simulate()
     D = tank.design_results
     assert D['Number of air compressors'] == 0
-    assert D['Air compressor stainless steel'] == 0
+    assert D['Number of diffusers'] == 0
+    assert D['Air compressor carbon steel'] == 0
     assert D['Diffuser area'] == 0
     assert D['Diffuser stainless steel'] == 0
     assert 'Air compressor' not in tank.baseline_purchase_costs
@@ -196,7 +232,7 @@ def test_tank_handles_zero_airflow_without_compressor_cost(tank):
 
 @pytest.mark.parametrize(
     'name',
-    ('diffuser_unit_cost', 'compressor_specific_mass'),
+    ('diffuser_unit_cost', 'unit_diffuser_flow_rate'),
 )
 def test_tank_rejects_negative_aeration_equipment_factors(tank, name):
     with pytest.raises(ValueError, match=name):
@@ -317,3 +353,211 @@ def test_co2_supply_rejects_invalid_component():
             outs='invalid_co2_supply_effluent',
             CO2_ID='missing_CO2',
         )
+
+
+def test_ultrafiltration_inherits_splitter_run(ultrafiltration):
+    feed = ultrafiltration.ins[0]
+    ultrafiltration.simulate()
+    permeate, retentate = ultrafiltration.outs
+    assert permeate.F_mass == pytest.approx(feed.F_mass * 0.4)
+    assert retentate.F_mass == pytest.approx(feed.F_mass * 0.6)
+
+
+def test_ultrafiltration_membrane_design(ultrafiltration):
+    ultrafiltration.simulate()
+    D = ultrafiltration.design_results
+    Q = ultrafiltration.ins[0].get_total_flow('m3/d')
+    mu = 497e-3 / (25 + 42.5)**1.5
+    flux = 2e5 / mu / 1e14
+    expected_area = Q * 1.5 / 24 / 3600 / flux
+
+    assert D['Influent flow'] == pytest.approx(Q)
+    assert D['Designed flow'] == pytest.approx(Q * 1.5)
+    assert D['Water viscosity'] == pytest.approx(mu)
+    assert D['Membrane flux'] == pytest.approx(flux)
+    assert D['Membrane area'] == pytest.approx(expected_area)
+    assert D['Membrane module area'] == pytest.approx(expected_area)
+    assert ultrafiltration.baseline_purchase_costs['Membrane'] == pytest.approx(
+        (-2.985 * np.log(expected_area) + 68.159) * 1.16 * expected_area
+    )
+    assert ultrafiltration.power_utility.rate == 0
+
+
+def test_ultrafiltration_includes_tank_cost_when_enabled(ultrafiltration):
+    ultrafiltration.include_tank = True
+    ultrafiltration.V_max = 3.8
+    ultrafiltration.simulate()
+    assert ultrafiltration.design_results['Tank volume'] == pytest.approx(3.8)
+    assert ultrafiltration.baseline_purchase_costs['Tank'] > 0
+
+
+def test_ultrafiltration_sparging_design_and_cost(ultrafiltration):
+    ultrafiltration.include_sparging = True
+    ultrafiltration.specific_sparging_air_demand = 0.7
+    ultrafiltration.diffuser_unit_cost = 12
+    ultrafiltration.compressor_specific_mass = 5
+    ultrafiltration.simulate()
+
+    D = ultrafiltration.design_results
+    A = D['Membrane area']
+    Q_air = 0.7 * A
+    power = get_P_blower(Q_air / 60, efficiency=0.7)
+    hp = auom('kW').convert(power, 'hp')
+    algorithm = IsothermalCompressor.baseline_cost_algorithms['Screw']
+    expected_compressor_cost = (
+        CEPCI_by_year[2022] / algorithm.CE * algorithm.cost(hp)
+    )
+
+    assert D['Sparging air flow'] == pytest.approx(Q_air)
+    assert D['Sparging air flow at compressor'] == pytest.approx(
+        auom('m3/hr').convert(Q_air, 'cfm')
+    )
+    assert D['Number of air compressors'] == 1
+    assert D['Sparging power'] == pytest.approx(power)
+    assert D['Air compressor stainless steel'] == pytest.approx(power * 5)
+    assert D['Diffuser area'] == pytest.approx(A)
+    assert D['Diffuser stainless steel'] == pytest.approx(A * 181 / 18.5)
+    assert ultrafiltration.baseline_purchase_costs[
+        'Air compressor'
+    ] == pytest.approx(expected_compressor_cost)
+    assert ultrafiltration.baseline_purchase_costs['Diffusers'] == pytest.approx(
+        A * 12
+    )
+    assert ultrafiltration.power_utility.rate == pytest.approx(power)
+
+
+def test_ultrafiltration_chemical_cleaning_usage_and_cost(ultrafiltration):
+    ultrafiltration.include_chemical_cleaning = True
+    ultrafiltration.V_max = 3.8
+    ultrafiltration.chemical_cleaning_frequency = 1 / 45
+    ultrafiltration.citric_acid_concentration = 2000
+    ultrafiltration.sodium_hypochlorite_concentration = 2000
+    ultrafiltration.simulate()
+
+    expected = 3.8 * 1000 * 2000 * 1e-6 * (1 / 45) / 24
+    assert ultrafiltration.design_results['Citric acid usage'] == pytest.approx(
+        expected
+    )
+    assert ultrafiltration.design_results[
+        'Sodium hypochlorite usage'
+    ] == pytest.approx(expected)
+    assert ultrafiltration.add_OPEX['Citric acid'] == pytest.approx(
+        expected * 1.06 * 1.16
+    )
+    assert ultrafiltration.add_OPEX['Sodium hypochlorite'] == pytest.approx(
+        expected * 0.88 / 0.125 * 1.16
+    )
+
+
+@pytest.mark.parametrize(
+    ('name', 'value'),
+    (
+        ('R_t', 0),
+        ('TMP', 0),
+        ('capacity_factor', 0),
+        ('V_max', 0),
+        ('specific_sparging_air_demand', -1),
+        ('blower_efficiency', 0),
+        ('blower_efficiency', 1.1),
+        ('diffuser_unit_cost', -1),
+        ('compressor_specific_mass', -1),
+        ('chemical_cleaning_frequency', -1),
+        ('citric_acid_concentration', -1),
+        ('sodium_hypochlorite_concentration', -1),
+        ('citric_acid_unit_price', -1),
+        ('sodium_hypochlorite_unit_price', -1),
+    ),
+)
+def test_ultrafiltration_rejects_invalid_inputs(ultrafiltration, name, value):
+    with pytest.raises(ValueError, match=name):
+        setattr(ultrafiltration, name, value)
+
+
+def test_ultrafiltration_rejects_invalid_temperature(ultrafiltration):
+    with pytest.raises(ValueError, match='T'):
+        ultrafiltration.T = -42.5
+
+
+def test_algae_centrifuge_inherits_splitter_run(algae_centrifuge):
+    feed = algae_centrifuge.ins[0]
+    algae_centrifuge.simulate()
+    centrate, algae_slurry = algae_centrifuge.outs
+    assert centrate.F_mass == pytest.approx(feed.F_mass * 0.4)
+    assert algae_slurry.F_mass == pytest.approx(feed.F_mass * 0.6)
+
+
+def test_algae_centrifuge_design_and_energy(algae_centrifuge):
+    algae_centrifuge.phi = 0.1
+    algae_centrifuge.simulate()
+    D = algae_centrifuge.design_results
+
+    Q_hr = algae_centrifuge.ins[0].get_total_flow('m3/hr')
+    Q_s = algae_centrifuge.ins[0].get_total_flow('m3/s')
+    mu = 497e-3 / (25 + 42.5)**1.5
+    vg = (1050 - 1000) * (5e-6)**2 * 9.8 / (18 * mu)
+    vg_eff = vg * (1 - 0.1)**4.65
+    Qm = Q_s * 3600 * 0.1e-6 / vg_eff
+    E_disc = 1.447 * Qm**(-0.304)
+    power = E_disc * Q_hr
+    weight = max(1126.1 * np.log(Q_hr) - 1204.8, 0.)
+
+    assert D['Influent flow'] == pytest.approx(Q_hr)
+    assert D['Water viscosity'] == pytest.approx(mu)
+    assert D['Gravity settling velocity'] == pytest.approx(vg)
+    assert D['Effective settling velocity'] == pytest.approx(vg_eff)
+    assert D['Master-curve flow'] == pytest.approx(Qm)
+    assert D['Disc centrifuge energy intensity'] == pytest.approx(E_disc)
+    assert D['Centrifuge stainless steel'] == pytest.approx(weight)
+    assert algae_centrifuge.power_utility.rate == pytest.approx(power)
+
+
+def test_algae_centrifuge_cost_and_parallel_count(algae_centrifuge):
+    algae_centrifuge.ins[0].set_flow([250000], 'kg/hr', ['H2O'])
+    algae_centrifuge.simulate()
+    D = algae_centrifuge.design_results
+    Q_hr = algae_centrifuge.ins[0].get_total_flow('m3/hr')
+    N = int(np.ceil(Q_hr / 100))
+    Q_each = Q_hr / N
+    expected_cost = N * CEPCI_by_year[2022] / 525.4 * 28100 * Q_each**0.574
+
+    assert D['Number of centrifuges'] == N
+    assert algae_centrifuge.baseline_purchase_costs['Centrifuge'] == pytest.approx(
+        expected_cost
+    )
+    assert algae_centrifuge.F_BM['Centrifuge'] == pytest.approx(2.03)
+
+
+def test_algae_centrifuge_handles_zero_flow():
+    pc.create_pm2_cmps()
+    feed = WasteStream('empty_centrifuge_feed')
+    centrifuge = AlgaeCentrifuge(
+        'CENT_empty',
+        ins=feed,
+        outs=('empty_centrate', 'empty_algae_slurry'),
+        split=0.4,
+    )
+    centrifuge.simulate()
+    assert centrifuge.design_results['Influent flow'] == 0
+    assert centrifuge.design_results['Master-curve flow'] == 0
+    assert centrifuge.design_results['Disc centrifuge energy intensity'] == 0
+    assert centrifuge.design_results['Centrifuge stainless steel'] == 0
+    assert centrifuge.design_results['Number of centrifuges'] == 0
+    assert centrifuge.baseline_purchase_costs['Centrifuge'] == 0
+    assert centrifuge.power_utility.rate == 0
+
+
+@pytest.mark.parametrize(
+    ('name', 'value'),
+    (
+        ('algal_cell_diameter', 0),
+        ('water_density', 0),
+        ('algal_particle_density', 999),
+        ('T', -42.5),
+        ('phi', -0.1),
+        ('phi', 1),
+        ('vgm', 0),
+    ),
+)
+def test_algae_centrifuge_rejects_invalid_inputs(algae_centrifuge, name, value):
+    with pytest.raises(ValueError, match=name):
+        setattr(algae_centrifuge, name, value)

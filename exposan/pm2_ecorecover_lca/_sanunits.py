@@ -6,6 +6,7 @@ EXPOsan: Exposition of sanitation and resource recovery systems
 This module is developed by:
 
     Zixuan Wang <wyatt4428@gmail.com>
+    Portia Ewing <portiae2@illinois.edu>
 
 This module is under the University of Illinois/NCSA Open Source License.
 Please refer to https://github.com/QSD-Group/EXPOsan/blob/main/LICENSE.txt
@@ -34,6 +35,8 @@ __all__ = ('Photobioreactor',
            'Ecorecoverypump',
            'Tank',
            'CO2Supply',
+           'Ultrafiltration',
+           'AlgaeCentrifuge',
            )
 #%%
 CSTR = su.CSTR
@@ -41,6 +44,7 @@ lb_to_kg = 0.453592
 acre_to_sq_m = 4046.86
 sq_feet_to_sq_m = 10.7639
 m_to_feet = 3.28084
+euro_to_usd = 1.16
 CEPCI_by_year.update({
     2022: 816.0,
     2023: 797.9,
@@ -77,12 +81,19 @@ class Tank(CSTR):
         takes precedence over ``kW_per_m3``.
     kW_per_m3 : float
         Specific mechanical mixing power in [kW/m3].
-    diffuser_unit_cost : float
-        Diffuser-grid cost in [USD/m2]. The default is zero as a placeholder
-        for a project-specific cost.
-    compressor_specific_mass : float
-        Stainless-steel compressor mass in [kg/kW]. The default is zero as a
-        placeholder for a project-specific mass correlation.
+    unit_diffuser_flow_rate : float
+        The flow rate a single diffuser provides [m3/d]. The default is 61.2 m3/d.
+        source: https://www.aquariustechnologies.com/wp-content/uploads/2019/07/Quantaer-Diffused-Aeration-Systems-Web.pdf
+    diffuser_unit_cost: float
+        The cost of one diffusor [USD]. The default is 445 USD based on 
+        Appendix 128-3 in https://cleanwaterservices.org/wp-content/uploads/2025/10/04-TM12_ForestGroveWRRFAerationEvaluation.pdf
+    Air compressor carbon steel follows the compressor weight relationship
+        [kg] = 16.013 * aeration power [hp] + 75.813.
+        source: https://us.kaeser.com/products-and-solutions/rotary-screw-compressors/3-hp.aspx
+    
+    References
+    ----------
+    # TODO: insert references from comments in this unit
     '''
     _F_BM_default = {
         'Tank': 2.3,
@@ -104,7 +115,8 @@ class Tank(CSTR):
         'Air flow rate': 'm3/d',
         'Air flow rate at compressor': 'cfm',
         'Number of air compressors': '',
-        'Air compressor stainless steel': 'kg',
+        'Air compressor carbon steel': 'kg',
+        'Number of diffusers': '',
         'Diffuser area': 'm2',
         'Diffuser stainless steel': 'kg',
     }
@@ -126,7 +138,7 @@ class Tank(CSTR):
                  blower_T=20, P_atm=101.325, P_inlet_loss=1,
                  P_diffuser_loss=7, h_submergance=5.18,
                  blower_efficiency=0.7, blower_K=0.283,
-                 diffuser_unit_cost=0., compressor_specific_mass=0.,
+                 unit_diffuser_flow_rate=61.2, diffuser_unit_cost=445.,
                  **kwargs):
         CSTR.__init__(
             self, ID=ID, ins=ins, outs=outs, split=split, thermo=thermo,
@@ -159,8 +171,8 @@ class Tank(CSTR):
         self.h_submergance = h_submergance
         self.blower_efficiency = blower_efficiency
         self.blower_K = blower_K
+        self.unit_diffuser_flow_rate = unit_diffuser_flow_rate
         self.diffuser_unit_cost = diffuser_unit_cost
-        self.compressor_specific_mass = compressor_specific_mass
 
     @staticmethod
     def _require_positive(name, value):
@@ -277,13 +289,13 @@ class Tank(CSTR):
         )
 
     @property
-    def compressor_specific_mass(self):
-        return self._compressor_specific_mass
+    def unit_diffuser_flow_rate(self):
+        return self._unit_diffuser_flow_rate
 
-    @compressor_specific_mass.setter
-    def compressor_specific_mass(self, value):
-        self._compressor_specific_mass = self._require_nonnegative(
-            'compressor_specific_mass', value,
+    @unit_diffuser_flow_rate.setter
+    def unit_diffuser_flow_rate(self, value):
+        self._unit_diffuser_flow_rate = self._require_positive(
+            'unit_diffuser_flow_rate', value,
         )
 
     @property
@@ -354,20 +366,30 @@ class Tank(CSTR):
             N_compressors = (
                 ceil(Q_air_acfm / max_acfm) if Q_air_acfm > 0 else 0
             )
+            N_diffusers = (
+                ceil(Q_air / self.unit_diffuser_flow_rate)
+                if Q_air > 0 else 0
+            )
             # Source: full-floor diffuser coverage specified for this model.
             diffuser_area = W * L
         else:
             Q_air = Q_air_acfm = aeration_power = 0.
             N_compressors = 0
+            N_diffusers = 0
             diffuser_area = 0.
 
         # Source: maximum ACFM from BioSTEAM's screw-compressor algorithm.
         D['Air flow rate'] = Q_air
         D['Air flow rate at compressor'] = Q_air_acfm
         D['Number of air compressors'] = N_compressors
-        D['Air compressor stainless steel'] = (
-            aeration_power * self.compressor_specific_mass
-        ) #kg/kW
+        D['Number of diffusers'] = N_diffusers
+        # Source: Kaeser rotary screw compressor specification,
+        # https://us.kaeser.com/products-and-solutions/rotary-screw-compressors/3-hp.aspx
+        aeration_power_hp = auom('kW').convert(aeration_power, 'hp')
+        D['Air compressor carbon steel'] = (
+            16.013 * aeration_power_hp + 75.813
+            if aeration_power > 0 else 0.
+        ) #kg
         D['Diffuser area'] = diffuser_area #m2
         D['Diffuser stainless steel'] = diffuser_area * 181 / 18.5 #kg
 
@@ -451,7 +473,7 @@ class Tank(CSTR):
             # BioSTEAM later scales all entries by parallel['self'].
             C['Air compressor'] = compressor_cost / N
             C['Diffusers'] = (
-                D['Diffuser area'] * self.diffuser_unit_cost / N
+                D['Number of diffusers'] * self.diffuser_unit_cost / N
             )
             self.F_M['Air compressor'] = 2.5
         else:
@@ -480,6 +502,10 @@ class CO2Supply(SanUnit):
         Component ID representing dissolved CO2.
     CO2_price : float
         CO2 price in 2016 [USD/metric tonne].
+
+    References
+    ----------
+    # TODO: insert references from comments in this unit
     '''
     _N_ins = 1
     _N_outs = 1
@@ -488,7 +514,7 @@ class CO2Supply(SanUnit):
         'Target CO2 concentration': 'mg/L',
         'Wastewater flow': 'L/hr',
         'Base CO2 makeup': 'kg/hr',
-        'CO2 supply': 'kg/hr',
+        'CO2 supply': 'kg/hr', 
         'Excess CO2 fraction': '',
     }
 
@@ -496,7 +522,7 @@ class CO2Supply(SanUnit):
             self, ID='', ins=None, outs=(), thermo=None,
             init_with='WasteStream', target_CO2=30.,
             excess_fraction=0.10, CO2_ID='S_CO2',
-            CO2_price=45.,
+            CO2_price=45., #source: https://docs.nlr.gov/docs/fy19osti/72716.pdf
         ):
         SanUnit.__init__(
             self, ID=ID, ins=ins, outs=outs, thermo=thermo,
@@ -539,7 +565,7 @@ class CO2Supply(SanUnit):
     def CO2_ID(self, value):
         if value not in self.components.IDs:
             raise ValueError(
-                f'`CO2_ID` must be one of the unit components; '
+                f'`CO2_ID` must be one of the system components; '
                 f'received {value!r}.'
             )
         self._CO2_ID = value
@@ -560,26 +586,17 @@ class CO2Supply(SanUnit):
         D = self.design_results
         influent = self.ins[0]
         Q = influent.get_total_flow('L/hr')
-        if Q > 0:
-            C_in = float(
-                influent.get_mass_concentration(
-                    'mg/L', IDs=(self.CO2_ID,),
-                )[0]
-            )
-        else:
-            C_in = 0.
-
+        C_in = float(
+            influent.get_mass_concentration(
+                'mg/L', IDs=(self.CO2_ID,),
+            )[0]
+        )
         # mg/L * L/hr * 1e-6 = kg/hr.
         base_makeup = max(self.target_CO2 - C_in, 0.) * Q * 1e-6
         # User-settable allowance for unmodeled CO2 losses.
         supply = base_makeup * (1 + self.excess_fraction)
 
-        D['Influent CO2 concentration'] = C_in
-        D['Target CO2 concentration'] = self.target_CO2
-        D['Wastewater flow'] = Q
-        D['Base CO2 makeup'] = base_makeup
         D['CO2 supply'] = supply
-        D['Excess CO2 fraction'] = self.excess_fraction
 
     def _cost(self):
         # Convert 2016 USD/metric tonne to 2022 USD/kg.
@@ -591,6 +608,727 @@ class CO2Supply(SanUnit):
             self.design_results['CO2 supply'] * price_2022
         )
 
+
+class Ultrafiltration(su.Splitter):
+    '''
+    Splitter-based ultrafiltration unit with membrane design and optional
+    support equipment accounting.
+
+    The material split is inherited from :class:`qsdsan.unit_operations.Splitter`;
+    this class only adds design, purchase-cost, power, and chemical OPEX
+    accounting.
+
+    Parameters
+    ----------
+    ID : str
+        Unit ID.
+    ins : sequence[Stream], optional
+        Inlet stream. The inlet flow is used to size the membrane area.
+    outs : sequence[Stream], optional
+        Outlet streams for the inherited splitter behavior.
+    thermo : Thermo, optional
+        Thermodynamic property package.
+    split : float, array, or dict
+        Split fraction passed to :class:`Splitter`; units are dimensionless.
+    order : sequence[str], optional
+        Component order for split arrays.
+    init_with : str
+        Stream class used to initialize missing streams.
+    F_BM_default : float, optional
+        Optional default bare-module factor override; units are dimensionless.
+    isdynamic : bool
+        Whether to initialize the unit as dynamic.
+    R_t : float
+        Total membrane resistance in [1/m].
+    T : float
+        Water temperature used in the viscosity equation in [deg C].
+    TMP : float
+        Transmembrane pressure in [Pa].
+    capacity_factor : float
+        Design redundancy factor applied to influent flow; units are
+        dimensionless.
+    include_tank : bool
+        Whether to include UF tank volume and tank purchase cost.
+    include_sparging : bool
+        Whether to include air sparging flow, blower power, compressor cost,
+        diffuser cost, and stainless-steel mass.
+    include_chemical_cleaning : bool
+        Whether to include citric-acid and sodium-hypochlorite cleaning usage
+        and OPEX.
+    V_max : float
+        UF tank working volume used for tank design and chemical cleaning in
+        [m3].
+    V_wf : float
+        Working volume fraction, i.e., working liquid volume divided by total
+        tank volume; units are dimensionless.
+    vessel_type : str
+        BioSTEAM mixing-tank purchase-cost algorithm name.
+    vessel_material : str
+        Tank material used by the BioSTEAM material factor.
+    specific_sparging_air_demand : float
+        Sparging air demand per membrane area in [m3/m2/hr].
+    blower_T : float
+        Air temperature used for blower power estimation in [deg C].
+    P_atm : float
+        Atmospheric pressure used for blower power estimation in [kPa].
+    P_inlet_loss : float
+        Blower inlet pressure loss in [kPa].
+    P_diffuser_loss : float
+        Diffuser pressure loss in [kPa].
+    h_submergance : float
+        Diffuser submergence depth used for blower pressure in [m].
+    blower_efficiency : float
+        Blower efficiency; units are dimensionless.
+    blower_K : float
+        Blower compression constant used by :func:`qsdsan.utils.get_P_blower`;
+        units are dimensionless.
+    diffuser_unit_cost : float
+        Diffuser purchase cost per diffuser area in [USD/m2].
+    compressor_specific_mass : float
+        Stainless-steel compressor mass per blower power in [kg/kW].
+    chemical_cleaning_frequency : float
+        Chemical cleaning frequency in [1/d].
+    citric_acid_concentration : float
+        Citric-acid cleaning concentration in [mg/L].
+    sodium_hypochlorite_concentration : float
+        Sodium-hypochlorite cleaning concentration in [mg/L].
+    citric_acid_unit_price : float
+        Citric-acid price in [USD/kg].
+    sodium_hypochlorite_unit_price : float
+        Sodium-hypochlorite price in [USD/kg].
+    '''
+    _F_BM_default = {
+        'Membrane': 3.2, #source: http://doi.org/10.1021/acs.iecr.2c00598
+        'Tank': 2.3,
+        'Air compressor': 2.15,
+        'Diffusers': 2.15,
+    }
+    _units = {
+        'Influent flow': 'm3/d',
+        'Designed flow': 'm3/d',
+        'Water viscosity': 'Pa*s',
+        'Membrane flux': 'm3/m2/s',
+        'Membrane area': 'm2',
+        'Membrane module area': 'm2',
+        'Tank volume': 'm3',
+        'Sparging air flow': 'm3/hr',
+        'Sparging air flow at compressor': 'cfm',
+        'Number of air compressors': '',
+        'Sparging power': 'kW',
+        'Air compressor stainless steel': 'kg',
+        'Diffuser area': 'm2',
+        'Diffuser stainless steel': 'kg',
+        'Citric acid usage': 'kg/hr',
+        'Sodium hypochlorite usage': 'kg/hr',
+    }
+    purchase_cost_algorithms = mix_tank_purchase_cost_algorithms
+
+    def __init__(
+            self, ID='', ins=None, outs=(), thermo=None, *, split,
+            order=None, init_with='WasteStream', F_BM_default=None,
+            isdynamic=False, R_t=5e12, #steady-state flux based on https://doi.org/10.1021/acs.est.3c10264; https://www.kovalus.com/wp-content/uploads/2020/10/puron-hf-modules.pdf
+            T=25., TMP=15.4e3,
+            capacity_factor=1.5, include_tank=False,
+            include_sparging=False, include_chemical_cleaning=False,
+            V_max=3.8*2, #source: https://doi.org/10.1021/acs.est.3c10264
+            V_wf=0.8, vessel_type='Conventional',
+            vessel_material='Stainless steel',
+            specific_sparging_air_demand=0.7, blower_T=20,
+            P_atm=101.325, P_inlet_loss=1, P_diffuser_loss=7,
+            h_submergance=5.18, blower_efficiency=0.7,
+            blower_K=0.283, diffuser_unit_cost=0.,
+            compressor_specific_mass=0.,
+            chemical_cleaning_frequency=1/30,# per day, source: https://doi.org/10.1016/j.scitotenv.2024.177273. change to 30 days for more conservative cleaning
+            citric_acid_concentration=2000.,
+            sodium_hypochlorite_concentration=2000.,
+            citric_acid_unit_price=1.06*euro_to_usd,
+            sodium_hypochlorite_unit_price=0.88/0.125*euro_to_usd,
+        ):
+        su.Splitter.__init__(
+            self, ID=ID, ins=ins, outs=outs, thermo=thermo, split=split,
+            order=order, init_with=init_with, F_BM_default=F_BM_default,
+            isdynamic=isdynamic,
+        )
+        self.R_t = R_t
+        self.T = T
+        self.TMP = TMP
+        self.capacity_factor = capacity_factor
+        self.include_tank = bool(include_tank)
+        self.include_sparging = bool(include_sparging)
+        self.include_chemical_cleaning = bool(include_chemical_cleaning)
+        self.V_max = V_max
+        self.V_wf = V_wf
+        self.vessel_type = vessel_type
+        self.vessel_material = vessel_material
+        self.specific_sparging_air_demand = specific_sparging_air_demand
+        self.blower_T = blower_T
+        self.P_atm = P_atm
+        self.P_inlet_loss = P_inlet_loss
+        self.P_diffuser_loss = P_diffuser_loss
+        self.h_submergance = h_submergance
+        self.blower_efficiency = blower_efficiency
+        self.blower_K = blower_K
+        self.diffuser_unit_cost = diffuser_unit_cost
+        self.compressor_specific_mass = compressor_specific_mass
+        self.chemical_cleaning_frequency = chemical_cleaning_frequency
+        self.citric_acid_concentration = citric_acid_concentration
+        self.sodium_hypochlorite_concentration = sodium_hypochlorite_concentration
+        self.citric_acid_unit_price = citric_acid_unit_price
+        self.sodium_hypochlorite_unit_price = sodium_hypochlorite_unit_price
+
+    @staticmethod
+    def _require_positive(name, value):
+        if value <= 0:
+            raise ValueError(f'`{name}` must be positive.')
+        return value
+
+    @staticmethod
+    def _require_nonnegative(name, value):
+        if value < 0:
+            raise ValueError(f'`{name}` must be non-negative.')
+        return value
+
+    @property
+    def R_t(self):
+        return self._R_t
+
+    @R_t.setter
+    def R_t(self, value):
+        self._R_t = self._require_positive('R_t', value)
+
+    @property
+    def T(self):
+        return self._T
+
+    @T.setter
+    def T(self, value):
+        if value <= -42.5:
+            raise ValueError('`T` must be greater than -42.5 deg C.')
+        self._T = value
+
+    @property
+    def TMP(self):
+        return self._TMP
+
+    @TMP.setter
+    def TMP(self, value):
+        self._TMP = self._require_positive('TMP', value)
+
+    @property
+    def capacity_factor(self):
+        return self._capacity_factor
+
+    @capacity_factor.setter
+    def capacity_factor(self, value):
+        self._capacity_factor = self._require_positive(
+            'capacity_factor', value,
+        )
+
+    @property
+    def V_max(self):
+        return self._V_max
+
+    @V_max.setter
+    def V_max(self, value):
+        self._V_max = self._require_positive('V_max', value)
+
+    @property
+    def V_wf(self):
+        return self._V_wf
+
+    @V_wf.setter
+    def V_wf(self, value):
+        value = self._require_positive('V_wf', value)
+        if value > 1:
+            raise ValueError('`V_wf` cannot exceed 1.')
+        self._V_wf = value
+
+    @property
+    def vessel_type(self):
+        return self._vessel_type
+
+    @vessel_type.setter
+    def vessel_type(self, value):
+        try:
+            algorithm = self.purchase_cost_algorithms[value]
+        except KeyError:
+            valid = ', '.join(self.purchase_cost_algorithms)
+            raise ValueError(
+                f'`vessel_type` must be one of: {valid}.'
+            ) from None
+        self._vessel_type = value
+        self.purchase_cost_algorithm = algorithm
+
+    @property
+    def vessel_material(self):
+        return self._vessel_material
+
+    @vessel_material.setter
+    def vessel_material(self, value):
+        try:
+            factor = vessel_material_factors[value]
+        except KeyError:
+            valid = ', '.join(vessel_material_factors)
+            raise ValueError(
+                f'No vessel material factor is available for {value!r}; '
+                f'choose one of: {valid}.'
+            ) from None
+        self._vessel_material = value
+        self.F_M['Tank'] = factor
+
+    @property
+    def specific_sparging_air_demand(self):
+        return self._specific_sparging_air_demand
+
+    @specific_sparging_air_demand.setter
+    def specific_sparging_air_demand(self, value):
+        self._specific_sparging_air_demand = self._require_nonnegative(
+            'specific_sparging_air_demand', value,
+        )
+
+    @property
+    def blower_efficiency(self):
+        return self._blower_efficiency
+
+    @blower_efficiency.setter
+    def blower_efficiency(self, value):
+        value = self._require_positive('blower_efficiency', value)
+        if value > 1:
+            raise ValueError('`blower_efficiency` cannot exceed 1.')
+        self._blower_efficiency = value
+
+    @property
+    def diffuser_unit_cost(self):
+        return self._diffuser_unit_cost
+
+    @diffuser_unit_cost.setter
+    def diffuser_unit_cost(self, value):
+        self._diffuser_unit_cost = self._require_nonnegative(
+            'diffuser_unit_cost', value,
+        )
+
+    @property
+    def compressor_specific_mass(self):
+        return self._compressor_specific_mass
+
+    @compressor_specific_mass.setter
+    def compressor_specific_mass(self, value):
+        self._compressor_specific_mass = self._require_nonnegative(
+            'compressor_specific_mass', value,
+        )
+
+    @property
+    def chemical_cleaning_frequency(self):
+        return self._chemical_cleaning_frequency
+
+    @chemical_cleaning_frequency.setter
+    def chemical_cleaning_frequency(self, value):
+        self._chemical_cleaning_frequency = self._require_nonnegative(
+            'chemical_cleaning_frequency', value,
+        )
+
+    @property
+    def citric_acid_concentration(self):
+        return self._citric_acid_concentration
+
+    @citric_acid_concentration.setter
+    def citric_acid_concentration(self, value):
+        self._citric_acid_concentration = self._require_nonnegative(
+            'citric_acid_concentration', value,
+        )
+
+    @property
+    def sodium_hypochlorite_concentration(self):
+        return self._sodium_hypochlorite_concentration
+
+    @sodium_hypochlorite_concentration.setter
+    def sodium_hypochlorite_concentration(self, value):
+        self._sodium_hypochlorite_concentration = self._require_nonnegative(
+            'sodium_hypochlorite_concentration', value,
+        )
+
+    @property
+    def citric_acid_unit_price(self):
+        return self._citric_acid_unit_price
+
+    @citric_acid_unit_price.setter
+    def citric_acid_unit_price(self, value):
+        self._citric_acid_unit_price = self._require_nonnegative(
+            'citric_acid_unit_price', value,
+        )
+
+    @property
+    def sodium_hypochlorite_unit_price(self):
+        return self._sodium_hypochlorite_unit_price
+
+    @sodium_hypochlorite_unit_price.setter
+    def sodium_hypochlorite_unit_price(self, value):
+        self._sodium_hypochlorite_unit_price = self._require_nonnegative(
+            'sodium_hypochlorite_unit_price', value,
+        )
+
+    def _get_membrane_design(self):
+        Q = self.ins[0].get_total_flow('m3/d')
+        Q_design = Q * self.capacity_factor
+
+        # Source: https://doi.org/10.1016/j.scitotenv.2024.177273.
+        mu = 497e-3 / (self.T + 42.5)**1.5 #relative viscoity, unit Pa x s, Source: https://doi.org/10.1016/j.desal.2021.115409
+        J = self.TMP / mu / self.R_t
+        A = Q_design / 24 / 3600 / J if Q_design else 0.
+        return Q, Q_design, mu, J, A
+
+    def _get_sparging_power(self, Q_air):
+        if not self.include_sparging:
+            return 0.
+
+        # Source: QSDsan wwt_design.get_P_blower; Q_air m3/min.
+        return get_P_blower(
+            Q_air / 60,
+            T=self.blower_T,
+            P_atm=self.P_atm,
+            P_inlet_loss=self.P_inlet_loss,
+            P_diffuser_loss=self.P_diffuser_loss,
+            h_submergance=self.h_submergance,
+            efficiency=self.blower_efficiency,
+            K=self.blower_K,
+        )
+
+    def _chemical_usage(self, concentration):#kg/hr
+        return (
+            self.V_max * 1000 * concentration * 1e-6
+            * self.chemical_cleaning_frequency / 24
+        )
+
+    def _design(self):
+        D = self.design_results
+        Q, Q_design, mu, J, A = self._get_membrane_design()
+
+        D['Influent flow'] = Q
+        D['Designed flow'] = Q_design
+        D['Water viscosity'] = mu
+        D['Membrane flux'] = J
+        D['Membrane area'] = A
+        D['Membrane module area'] = A
+        D['Tank volume'] = self.V_max if self.include_tank else 0.
+        D['Sparging air flow'] = 0.
+        D['Sparging air flow at compressor'] = 0.
+        D['Number of air compressors'] = 0
+        D['Sparging power'] = 0.
+        D['Air compressor stainless steel'] = 0.
+        D['Diffuser area'] = 0.
+        D['Diffuser stainless steel'] = 0.
+        D['Citric acid usage'] = 0.
+        D['Sodium hypochlorite usage'] = 0.
+
+        if self.include_sparging:
+            # Source: specific demand from https://doi.org/10.1016/j.scitotenv.2024.177273.
+            Q_air = self.specific_sparging_air_demand * A
+            power = self._get_sparging_power(Q_air)
+            algorithm = IsothermalCompressor.baseline_cost_algorithms['Screw']
+            Q_air_acfm = auom('m3/hr').convert(Q_air, 'cfm')
+            max_acfm = algorithm.acfm_bounds[1]
+            N_compressors = (
+                ceil(Q_air_acfm / max_acfm) if Q_air_acfm > 0 else 0
+            )
+
+            # Source: compressor sizing and diffuser mass method used in Tank.
+            D['Sparging air flow'] = Q_air
+            D['Sparging air flow at compressor'] = Q_air_acfm
+            D['Number of air compressors'] = N_compressors
+            D['Sparging power'] = power
+            D['Air compressor stainless steel'] = (
+                power * self.compressor_specific_mass
+            )
+            D['Diffuser area'] = A
+            D['Diffuser stainless steel'] = A * 181 / 18.5
+
+        if self.include_chemical_cleaning:
+            # Source: cleaning frequency and concentrations from
+            # https://doi.org/10.1016/j.scitotenv.2024.177273.
+            D['Citric acid usage'] = self._chemical_usage(
+                self.citric_acid_concentration,
+            ) #kg/hr
+            D['Sodium hypochlorite usage'] = self._chemical_usage(
+                self.sodium_hypochlorite_concentration,
+            )
+
+    def _cost(self):
+        D = self.design_results
+        C = self.baseline_purchase_costs
+        A = D['Membrane area']
+
+        if A > 0:
+            # Source: https://doi.org/10.1016/j.scitotenv.2024.177273.
+            membrane_unit_cost = (
+                -2.985 * np.log(D['Membrane module area']) + 68.159
+            )
+            C['Membrane'] = membrane_unit_cost * euro_to_usd * A
+        else:
+            C['Membrane'] = 0.
+
+        if self.include_tank:
+            # Source: BioSTEAM MixTank purchase-cost method used in Tank.
+            N, Cp = compute_number_of_tanks_and_purchase_cost(
+                self.V_max / self.V_wf, self.purchase_cost_algorithm,
+            )
+            default_material = self.purchase_cost_algorithm.material
+            C['Tank'] = (
+                N * Cp / vessel_material_factors.get(default_material, 1.)
+            )
+        else:
+            C.pop('Tank', None)
+
+        if self.include_sparging:
+            N_compressors = D['Number of air compressors']
+            sparging_power = D['Sparging power']
+            if N_compressors and sparging_power > 0:
+                # Source: BioSTEAM IsothermalCompressor screw-compressor
+                # baseline algorithm, matching Tank.
+                algorithm = (
+                    IsothermalCompressor.baseline_cost_algorithms['Screw']
+                )
+                total_hp = auom('kW').convert(sparging_power, 'hp')
+                hp_per_compressor = total_hp / N_compressors
+                compressor_cost = (
+                    N_compressors * CEPCI_by_year[2022] / algorithm.CE
+                    * algorithm.cost(hp_per_compressor)
+                )
+            else:
+                compressor_cost = 0.
+            C['Air compressor'] = compressor_cost
+            C['Diffusers'] = D['Diffuser area'] * self.diffuser_unit_cost
+            self.F_M['Air compressor'] = 2.5
+        else:
+            C.pop('Air compressor', None)
+            C.pop('Diffusers', None)
+
+        if self.include_chemical_cleaning:
+            self.add_OPEX['Citric acid'] = (
+                D['Citric acid usage'] * self.citric_acid_unit_price
+            )
+            self.add_OPEX['Sodium hypochlorite'] = (
+                D['Sodium hypochlorite usage']
+                * self.sodium_hypochlorite_unit_price
+            )
+        else:
+            self.add_OPEX.pop('Citric acid', None)
+            self.add_OPEX.pop('Sodium hypochlorite', None)
+
+        self.power_utility.rate = D['Sparging power']
+
+
+class AlgaeCentrifuge(su.Splitter):
+    '''
+    Splitter-based algae centrifuge with design, purchase-cost, and energy
+    accounting.
+
+    The material split is inherited from :class:`qsdsan.unit_operations.Splitter`;
+    this class only adds centrifuge design and cost accounting.
+
+    Parameters
+    ----------
+    ID : str
+        Unit ID.
+    ins : sequence[Stream], optional
+        Inlet stream. The inlet volumetric flow is used for design and cost.
+    outs : sequence[Stream], optional
+        Outlet streams for the inherited splitter behavior.
+    thermo : Thermo, optional
+        Thermodynamic property package.
+    split : float, array, or dict
+        Split fraction passed to :class:`Splitter`; units are dimensionless.
+    order : sequence[str], optional
+        Component order for split arrays.
+    init_with : str
+        Stream class used to initialize missing streams.
+    F_BM_default : float, optional
+        Optional default bare-module factor override; units are dimensionless.
+    isdynamic : bool
+        Whether to initialize the unit as dynamic.
+    algal_cell_diameter : float
+        Algal particle diameter in [m].
+    algal_particle_density : float
+        Algal particle density in [kg/m3].
+    water_density : float
+        Water density in [kg/m3].
+    T : float
+        Water temperature used in the viscosity equation in [deg C].
+    phi : float
+        Solids volume fraction for hindered-settling correction; units are
+        dimensionless.
+    vgm : float
+        Master-curve settling velocity in [m/s].
+
+    References
+    ----------
+    Cost follows BioSTEAM ``LiquidsCentrifuge``:
+    ``C = 28100 * Q**0.574`` with ``Q`` in [m3/hr], CEPCI 525.4,
+    upper-bound flow 100 m3/hr, and bare-module factor 2.03.
+
+    Energy equations follow Najjar and Abu-Shamleh, Algal Research 51
+    (2020) 102046, http://doi.org/10.1016/j.algal.2020.102046.
+
+    Stainless-steel weight follows the Dolphin Centrifuge capacity
+    correlation:
+    ``weight = 1126.1*ln(Q) - 1204.8`` with ``Q`` in [m3/hr].
+    '''
+    _F_BM_default = {'Centrifuge': 2.03}
+    _units = {
+        'Influent flow': 'm3/hr',
+        'Water viscosity': 'Pa*s',
+        'Gravity settling velocity': 'm/s',
+        'Effective settling velocity': 'm/s',
+        'Master-curve flow': 'm3/hr',
+        'Disc centrifuge energy intensity': 'kWh/m3',
+        'Centrifuge stainless steel': 'kg',
+        'Number of centrifuges': '',
+    }
+
+    def __init__(
+            self, ID='', ins=None, outs=(), thermo=None, *, split,
+            order=None, init_with='WasteStream', F_BM_default=None,
+            isdynamic=False, algal_cell_diameter=5e-6,
+            algal_particle_density=1050., water_density=1000.,
+            T=25., phi=0., vgm=0.1e-6,
+        ):
+        su.Splitter.__init__(
+            self, ID=ID, ins=ins, outs=outs, thermo=thermo, split=split,
+            order=order, init_with=init_with, F_BM_default=F_BM_default,
+            isdynamic=isdynamic,
+        )
+        self.water_density = water_density
+        self.algal_cell_diameter = algal_cell_diameter
+        self.algal_particle_density = algal_particle_density
+        self.T = T
+        self.phi = phi
+        self.vgm = vgm
+
+    @staticmethod
+    def _require_positive(name, value):
+        if value <= 0:
+            raise ValueError(f'`{name}` must be positive.')
+        return value
+
+    @property
+    def algal_cell_diameter(self):
+        return self._algal_cell_diameter
+
+    @algal_cell_diameter.setter
+    def algal_cell_diameter(self, value):
+        self._algal_cell_diameter = self._require_positive(
+            'algal_cell_diameter', value,
+        )
+
+    @property
+    def water_density(self):
+        return self._water_density
+
+    @water_density.setter
+    def water_density(self, value):
+        self._water_density = self._require_positive('water_density', value)
+
+    @property
+    def algal_particle_density(self):
+        return self._algal_particle_density
+
+    @algal_particle_density.setter
+    def algal_particle_density(self, value):
+        if value <= self.water_density:
+            raise ValueError(
+                '`algal_particle_density` must be greater than '
+                '`water_density`.',
+            )
+        self._algal_particle_density = value
+
+    @property
+    def T(self):
+        return self._T
+
+    @T.setter
+    def T(self, value):
+        if value <= -42.5:
+            raise ValueError('`T` must be greater than -42.5 deg C.')
+        self._T = value
+
+    @property
+    def phi(self):
+        return self._phi
+
+    @phi.setter
+    def phi(self, value):
+        if not 0 <= value < 1:
+            raise ValueError(
+                '`phi` must be greater than or equal to 0 and less than 1.'
+            )
+        self._phi = value
+
+    @property
+    def vgm(self):
+        return self._vgm
+
+    @vgm.setter
+    def vgm(self, value):
+        self._vgm = self._require_positive('vgm', value)
+
+    def _get_mu(self):
+        # Source: same viscosity relationship used in Ultrafiltration.
+        return 497e-3 / (self.T + 42.5)**1.5
+
+    def _get_gravity_settling_velocity(self, mu):
+        # Source: Eq. 7 in Najjar and Abu-Shamleh (2020),
+        # http://doi.org/10.1016/j.algal.2020.102046.
+        return (
+            (self.algal_particle_density - self.water_density)
+            * self.algal_cell_diameter**2 * 9.8 / (18 * mu)
+        )
+
+    def _design(self):
+        D = self.design_results
+        Q_hr = self.ins[0].get_total_flow('m3/hr')
+        mu = self._get_mu()
+        vg = self._get_gravity_settling_velocity(mu)
+        vg_eff = vg * (1 - self.phi)**4.65
+
+        if Q_hr > 0:
+            # Source: Eq. 15 in Najjar and Abu-Shamleh (2020),
+            # converts actual flow to master-curve flow [m3/hr].
+            Q_s = self.ins[0].get_total_flow('m3/s')
+            Qm = Q_s * 3600 * self.vgm / vg_eff
+            # Source: Eq. 16 in Najjar and Abu-Shamleh (2020),
+            # disc centrifuge energy intensity [kWh/m3].
+            E_disc = 1.447 * Qm**(-0.304)
+            # Source: Dolphin Centrifuge capacity correlation;
+            # clamp to zero outside the low-flow correlation range.
+            weight = max(1126.1 * np.log(Q_hr) - 1204.8, 0.)
+        else:
+            Qm = E_disc = weight = 0.
+
+        D['Influent flow'] = Q_hr
+        D['Water viscosity'] = mu
+        D['Gravity settling velocity'] = vg
+        D['Effective settling velocity'] = vg_eff
+        D['Master-curve flow'] = Qm
+        D['Disc centrifuge energy intensity'] = E_disc
+        D['Centrifuge stainless steel'] = weight
+        D['Number of centrifuges'] = ceil(Q_hr / 100) if Q_hr > 0 else 0
+
+    def _cost(self):
+        D = self.design_results
+        C = self.baseline_purchase_costs
+        Q_hr = D['Influent flow']
+        N = D['Number of centrifuges']
+        if Q_hr > 0:
+            Q_each = Q_hr / N
+            # Source: BioSTEAM LiquidsCentrifuge cost correlation.
+            C['Centrifuge'] = (
+                N * CEPCI_by_year[2022] / 525.4
+                * 28100 * Q_each**0.574
+            )
+        else:
+            C['Centrifuge'] = 0.
+        self.power_utility.rate = (
+            D['Disc centrifuge energy intensity'] * Q_hr
+        )
 
 @cost(basis = 'Aerial footage-volume-to-area ratio', ID='Glass tube & fittings', units='m3/m2',
       cost = 233240/acre_to_sq_m, S=0.029499829299047615, CE=CEPCI_by_year[2014], n=1, BM=1.1) #ref:https://docs.nrel.gov/docs/fy19osti/72716.pdf
