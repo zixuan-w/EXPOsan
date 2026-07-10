@@ -34,6 +34,7 @@ from math import pi, ceil
 __all__ = ('Photobioreactor',
            'Ecorecoverypump',
            'Tank',
+           'Mixtank',
            'CO2Supply',
            'Ultrafiltration',
            'AlgaeCentrifuge',
@@ -51,8 +52,53 @@ CEPCI_by_year.update({
     2024: 798.0,   # https://reg.lub.lu.se/luur/download?func=downloadFile&recordOId=9209157&fileOId=9209158
     2025: 811.0,   # estimated as 2024 * 1.016
 })
+hours_per_year = 365 * 24
 
-class Tank(CSTR):
+
+def _annual_to_hourly_cost(cost):
+    return cost / hours_per_year
+
+
+def _installed_capital(unit, IDs=None, include_parallel=True):
+    C = unit.baseline_purchase_costs
+    if IDs is None:
+        IDs = tuple(C)
+    total = 0.
+    for ID in IDs:
+        if ID not in C:
+            continue
+        total += (
+            C[ID] * unit.F_BM.get(ID, 1.) * unit.F_D.get(ID, 1.)
+            * unit.F_P.get(ID, 1.) * unit.F_M.get(ID, 1.)
+        )
+    if include_parallel:
+        total *= unit.parallel.get('self', 1)
+    return total
+
+
+def _require_nonnegative(name, value):
+    if value < 0:
+        raise ValueError(f'`{name}` must be non-negative.')
+    return value
+
+
+def _require_positive(name, value):
+    if value <= 0:
+        raise ValueError(f'`{name}` must be positive.')
+    return value
+
+
+def _warn_if_flow_outside_NEIWPCC(unit, Q_m3_d, name):
+    if 0 < Q_m3_d < 1400 or Q_m3_d > 76000:
+        warn(
+            f'The NEIWPCC labor-hour relationship for {name} may not hold '
+            f'for flow rates outside 1400-76000 m3/d; current flow is '
+            f'{Q_m3_d:.3g} m3/d.',
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+class Mixtank(CSTR):
     '''
     Tank with design, BioSTEAM mixing-tank cost, and power estimation.
 
@@ -87,6 +133,16 @@ class Tank(CSTR):
     diffuser_unit_cost: float
         The cost of one diffusor [USD]. The default is 445 USD based on 
         Appendix 128-3 in https://cleanwaterservices.org/wp-content/uploads/2025/10/04-TM12_ForestGroveWRRFAerationEvaluation.pdf
+    labor_wage : float
+        Labor wage in [USD/hr].
+    tank_maintenance_ratio : float
+        Annual tank maintenance and replacement cost as a fraction of installed
+        capital. The default is 0.06 [1/yr].
+    tank_labor_hours : float
+        Annual labor requirement per tank. The default is 36.5 [hr/tank/yr].
+    blower_labor_hours : float
+        Annual labor requirement per air compressor/blower when aeration is
+        included. The default is 73 [hr/compressor/yr].
     Air compressor carbon steel follows the compressor weight relationship
         [kg] = 16.013 * aeration power [hp] + 75.813.
         source: https://us.kaeser.com/products-and-solutions/rotary-screw-compressors/3-hp.aspx
@@ -139,6 +195,10 @@ class Tank(CSTR):
                  P_diffuser_loss=7, h_submergance=5.18,
                  blower_efficiency=0.7, blower_K=0.283,
                  unit_diffuser_flow_rate=61.2, diffuser_unit_cost=445.,
+                 labor_wage=0.,
+                 tank_maintenance_ratio=0.06,
+                 tank_labor_hours=36.5,
+                 blower_labor_hours=73.,
                  **kwargs):
         CSTR.__init__(
             self, ID=ID, ins=ins, outs=outs, split=split, thermo=thermo,
@@ -173,6 +233,18 @@ class Tank(CSTR):
         self.blower_K = blower_K
         self.unit_diffuser_flow_rate = unit_diffuser_flow_rate
         self.diffuser_unit_cost = diffuser_unit_cost
+        self.labor_wage = self._require_nonnegative(
+            'labor_wage', labor_wage,
+        )
+        self.tank_maintenance_ratio = self._require_nonnegative(
+            'tank_maintenance_ratio', tank_maintenance_ratio,
+        )
+        self.tank_labor_hours = self._require_nonnegative(
+            'tank_labor_hours', tank_labor_hours,
+        )
+        self.blower_labor_hours = self._require_nonnegative(
+            'blower_labor_hours', blower_labor_hours,
+        )
 
     @staticmethod
     def _require_positive(name, value):
@@ -430,6 +502,24 @@ class Tank(CSTR):
         specific_power = self._mixed.mu * self.mixing_intensity**2 / 1000
         return specific_power * self.V_max
 
+    def _calc_replacement_cost(self):
+        # Maintenance source: 6% of total installed capital,
+        # https://doi.org/10.1016/j.bej.2017.08.006.
+        return _annual_to_hourly_cost(
+            self.tank_maintenance_ratio * _installed_capital(self)
+        )
+
+    def _calc_maintenance_labor_cost(self):
+        # Tank labor source: NEIWPCC Northeast Staffing Guide,
+        # https://neiwpcc.org/wp-content/uploads/2020/08/NEIWPCC-Northeast-Staffing-Guide.pdf.
+        N_tanks = self.parallel.get('self', 1)
+        hours = self.tank_labor_hours * N_tanks
+        if self.include_aeration_power:
+            hours += self.blower_labor_hours * self.design_results.get(
+                'Number of air compressors', 0,
+            )
+        return _annual_to_hourly_cost(hours * self.labor_wage)
+
     def _cost(self):
         D = self.design_results
         C = self.baseline_purchase_costs
@@ -442,6 +532,8 @@ class Tank(CSTR):
             C.clear()
             self.parallel.pop('self', None)
             self.power_utility.rate = 0.
+            self.add_OPEX['labor'] = 0.
+            self.add_OPEX['maintenance and replacement'] = 0.
             return
 
         self.parallel['self'] = N
@@ -482,6 +574,13 @@ class Tank(CSTR):
 
         # BioSTEAM scales utilities by parallel['self'] after _cost().
         self.power_utility.rate = total_power / N
+        self.add_OPEX['labor'] = self._calc_maintenance_labor_cost()
+        self.add_OPEX['maintenance and replacement'] = (
+            self._calc_replacement_cost()
+        )
+
+
+Tank = Mixtank
 
 
 class CO2Supply(SanUnit):
@@ -502,6 +601,13 @@ class CO2Supply(SanUnit):
         Component ID representing dissolved CO2.
     CO2_price : float
         CO2 price in 2016 [USD/metric tonne].
+    labor_wage : float
+        Labor wage in [USD/hr].
+    CO2_supply_maintenance_ratio : float
+        CO2 supply maintenance cost as a fraction of CO2 purchase cost. The
+        default is 0.016 [dimensionless].
+    CO2_labor_hours_per_kg : float
+        Labor requirement per kg of supplied CO2. The default is 0.015 [hr/kg].
 
     References
     ----------
@@ -523,6 +629,9 @@ class CO2Supply(SanUnit):
             init_with='WasteStream', target_CO2=30.,
             excess_fraction=0.10, CO2_ID='S_CO2',
             CO2_price=45., #source: https://docs.nlr.gov/docs/fy19osti/72716.pdf
+            labor_wage=0.,
+            CO2_supply_maintenance_ratio=0.016,
+            CO2_labor_hours_per_kg=0.015,
         ):
         SanUnit.__init__(
             self, ID=ID, ins=ins, outs=outs, thermo=thermo,
@@ -532,6 +641,15 @@ class CO2Supply(SanUnit):
         self.excess_fraction = excess_fraction
         self.CO2_ID = CO2_ID
         self.CO2_price = CO2_price
+        self.labor_wage = self._require_nonnegative(
+            'labor_wage', labor_wage,
+        )
+        self.CO2_supply_maintenance_ratio = self._require_nonnegative(
+            'CO2_supply_maintenance_ratio', CO2_supply_maintenance_ratio,
+        )
+        self.CO2_labor_hours_per_kg = self._require_nonnegative(
+            'CO2_labor_hours_per_kg', CO2_labor_hours_per_kg,
+        )
 
     @staticmethod
     def _require_nonnegative(name, value):
@@ -579,24 +697,47 @@ class CO2Supply(SanUnit):
         self._CO2_price = self._require_nonnegative('CO2_price', value)
 
     def _run(self):
-        # Source: QSDsan Copier; this unit does not alter the mass balance.
         self.outs[0].copy_like(self.ins[0])
 
     def _design(self):
         D = self.design_results
         influent = self.ins[0]
         Q = influent.get_total_flow('L/hr')
-        C_in = float(
-            influent.get_mass_concentration(
-                'mg/L', IDs=(self.CO2_ID,),
-            )[0]
+        C_in = (
+            0. if Q == 0 else float(
+                influent.get_mass_concentration(
+                    'mg/L', IDs=(self.CO2_ID,),
+                )[0]
+            )
         )
         # mg/L * L/hr * 1e-6 = kg/hr.
         base_makeup = max(self.target_CO2 - C_in, 0.) * Q * 1e-6
         # User-settable allowance for unmodeled CO2 losses.
         supply = base_makeup * (1 + self.excess_fraction)
 
+        D['Influent CO2 concentration'] = C_in
+        D['Target CO2 concentration'] = self.target_CO2
+        D['Wastewater flow'] = Q
+        D['Base CO2 makeup'] = base_makeup
         D['CO2 supply'] = supply
+        D['Excess CO2 fraction'] = self.excess_fraction
+
+    def _calc_replacement_cost(self):
+        # Maintenance defaults to 1.6% of the purchased CO2 supply cost.
+        return (
+            self.CO2_supply_maintenance_ratio
+            * self.add_OPEX.get('CO2 supply', 0.)
+        )
+
+    def _calc_maintenance_labor_cost(self):
+        # Labor source: Reliant BevCarb bulk CO2 refill basis,
+        # https://www.reliantbevcarb.com/products/bulkco2.
+        # Assumes 2 hr labor per 340 kg CO2 refill, rounded to 0.015 hr/kg.
+        return (
+            self.CO2_labor_hours_per_kg
+            * self.design_results['CO2 supply']
+            * self.labor_wage
+        )
 
     def _cost(self):
         # Convert 2016 USD/metric tonne to 2022 USD/kg.
@@ -606,6 +747,10 @@ class CO2Supply(SanUnit):
         )
         self.add_OPEX['CO2 supply'] = (
             self.design_results['CO2 supply'] * price_2022
+        )
+        self.add_OPEX['labor'] = self._calc_maintenance_labor_cost()
+        self.add_OPEX['maintenance and replacement'] = (
+            self._calc_replacement_cost()
         )
 
 
@@ -696,6 +841,28 @@ class Ultrafiltration(su.Splitter):
         Citric-acid price in [USD/kg].
     sodium_hypochlorite_unit_price : float
         Sodium-hypochlorite price in [USD/kg].
+    labor_wage : float
+        Labor wage in [USD/hr].
+    membrane_lifetime : float
+        Membrane replacement lifetime. The default is 5 [yr].
+    tank_maintenance_ratio : float
+        Annual tank maintenance cost as a fraction of installed tank capital.
+        The default is 0.06 [1/yr].
+    sparging_maintenance_ratio : float
+        Annual sparging equipment maintenance cost as a fraction of installed
+        sparging capital. The default is 0.06 [1/yr].
+    UF_labor_coefficient : float
+        Coefficient in the UF labor-hour equation
+        ``hours/yr = coefficient * Q**exponent``. The default is 5.524.
+    UF_labor_exponent : float
+        Exponent in the UF labor-hour equation where Q is influent flow
+        [m3/d]. The default is 0.37.
+    blower_labor_hours : float
+        Annual labor requirement per sparging compressor/blower. The default
+        is 73 [hr/compressor/yr].
+    chemical_cleaning_labor_hours : float
+        Labor requirement per chemical cleaning event. The default is 1
+        [hr/cleaning].
     '''
     _F_BM_default = {
         'Membrane': 3.2, #source: http://doi.org/10.1021/acs.iecr.2c00598
@@ -743,6 +910,14 @@ class Ultrafiltration(su.Splitter):
             sodium_hypochlorite_concentration=2000.,
             citric_acid_unit_price=1.06*euro_to_usd,
             sodium_hypochlorite_unit_price=0.88/0.125*euro_to_usd,
+            labor_wage=0.,
+            membrane_lifetime=5.,
+            tank_maintenance_ratio=0.06,
+            sparging_maintenance_ratio=0.06,
+            UF_labor_coefficient=5.524,
+            UF_labor_exponent=0.37,
+            blower_labor_hours=73.,
+            chemical_cleaning_labor_hours=1.,
         ):
         su.Splitter.__init__(
             self, ID=ID, ins=ins, outs=outs, thermo=thermo, split=split,
@@ -775,6 +950,31 @@ class Ultrafiltration(su.Splitter):
         self.sodium_hypochlorite_concentration = sodium_hypochlorite_concentration
         self.citric_acid_unit_price = citric_acid_unit_price
         self.sodium_hypochlorite_unit_price = sodium_hypochlorite_unit_price
+        self.labor_wage = self._require_nonnegative(
+            'labor_wage', labor_wage,
+        )
+        self.membrane_lifetime = self._require_positive(
+            'membrane_lifetime', membrane_lifetime,
+        )
+        self.tank_maintenance_ratio = self._require_nonnegative(
+            'tank_maintenance_ratio', tank_maintenance_ratio,
+        )
+        self.sparging_maintenance_ratio = self._require_nonnegative(
+            'sparging_maintenance_ratio', sparging_maintenance_ratio,
+        )
+        self.UF_labor_coefficient = self._require_nonnegative(
+            'UF_labor_coefficient', UF_labor_coefficient,
+        )
+        self.UF_labor_exponent = self._require_nonnegative(
+            'UF_labor_exponent', UF_labor_exponent,
+        )
+        self.blower_labor_hours = self._require_nonnegative(
+            'blower_labor_hours', blower_labor_hours,
+        )
+        self.chemical_cleaning_labor_hours = self._require_nonnegative(
+            'chemical_cleaning_labor_hours',
+            chemical_cleaning_labor_hours,
+        )
 
     @staticmethod
     def _require_positive(name, value):
@@ -999,6 +1199,49 @@ class Ultrafiltration(su.Splitter):
             * self.chemical_cleaning_frequency / 24
         )
 
+    def _calc_replacement_cost(self):
+        C = self.baseline_purchase_costs
+        annual = 0.
+        # Membrane lifetime source:
+        # https://doi.org/10.1016/j.jclepro.2019.01.321.
+        annual += C.get('Membrane', 0.) / self.membrane_lifetime
+        if self.include_tank:
+            # Tank maintenance source:
+            # https://doi.org/10.1016/j.bej.2017.08.006.
+            annual += self.tank_maintenance_ratio * _installed_capital(
+                self, ('Tank',), include_parallel=False,
+            )
+        if self.include_sparging:
+            # Sparging equipment maintenance source:
+            # https://doi.org/10.1016/j.bej.2017.08.006.
+            annual += self.sparging_maintenance_ratio * _installed_capital(
+                self, ('Air compressor', 'Diffusers'),
+                include_parallel=False,
+            )
+        return _annual_to_hourly_cost(annual)
+
+    def _calc_maintenance_labor_cost(self):
+        D = self.design_results
+        Q = D.get('Influent flow', self.ins[0].get_total_flow('m3/d'))
+        _warn_if_flow_outside_NEIWPCC(self, Q, 'ultrafiltration')
+        # Membrane labor source: NEIWPCC Northeast Staffing Guide,
+        # https://neiwpcc.org/wp-content/uploads/2020/08/NEIWPCC-Northeast-Staffing-Guide.pdf.
+        hours = (
+            self.UF_labor_coefficient * Q**self.UF_labor_exponent
+            if Q > 0 else 0.
+        )
+        if self.include_sparging:
+            hours += (
+                self.blower_labor_hours
+                * D.get('Number of air compressors', 0)
+            )
+        if self.include_chemical_cleaning:
+            hours += (
+                self.chemical_cleaning_labor_hours
+                * self.chemical_cleaning_frequency * hours_per_year / 24
+            )
+        return _annual_to_hourly_cost(hours * self.labor_wage)
+
     def _design(self):
         D = self.design_results
         Q, Q_design, mu, J, A = self._get_membrane_design()
@@ -1115,6 +1358,10 @@ class Ultrafiltration(su.Splitter):
             self.add_OPEX.pop('Sodium hypochlorite', None)
 
         self.power_utility.rate = D['Sparging power']
+        self.add_OPEX['labor'] = self._calc_maintenance_labor_cost()
+        self.add_OPEX['maintenance and replacement'] = (
+            self._calc_replacement_cost()
+        )
 
 
 class AlgaeCentrifuge(su.Splitter):
@@ -1158,6 +1405,21 @@ class AlgaeCentrifuge(su.Splitter):
         dimensionless.
     vgm : float
         Master-curve settling velocity in [m/s].
+    UF_flow : float, optional
+        Influent flow to the upstream ultrafiltration unit in [m3/d], used for
+        centrifuge labor estimation.
+    labor_wage : float
+        Labor wage in [USD/hr].
+    centrifuge_maintenance_ratio : float
+        Annual centrifuge maintenance cost as a fraction of installed capital.
+        The default is 0.05 [1/yr].
+    centrifuge_labor_slope : float
+        Slope in the centrifuge labor equation
+        ``hours/unit/yr = slope * Q + intercept`` where Q is the upstream UF
+        influent flow. The default is 0.0018 [hr/unit/yr/(m3/d)].
+    centrifuge_labor_intercept : float
+        Intercept in the centrifuge labor equation. The default is 45.028
+        [hr/unit/yr].
 
     References
     ----------
@@ -1189,7 +1451,11 @@ class AlgaeCentrifuge(su.Splitter):
             order=None, init_with='WasteStream', F_BM_default=None,
             isdynamic=False, algal_cell_diameter=5e-6,
             algal_particle_density=1050., water_density=1000.,
-            T=25., phi=0., vgm=0.1e-6,
+            T=25., phi=0., vgm=0.1e-6, UF_flow=None,
+            labor_wage=0.,
+            centrifuge_maintenance_ratio=0.05,
+            centrifuge_labor_slope=0.0018,
+            centrifuge_labor_intercept=45.028,
         ):
         su.Splitter.__init__(
             self, ID=ID, ins=ins, outs=outs, thermo=thermo, split=split,
@@ -1202,11 +1468,30 @@ class AlgaeCentrifuge(su.Splitter):
         self.T = T
         self.phi = phi
         self.vgm = vgm
+        self.UF_flow = UF_flow
+        self.labor_wage = self._require_nonnegative(
+            'labor_wage', labor_wage,
+        )
+        self.centrifuge_maintenance_ratio = self._require_nonnegative(
+            'centrifuge_maintenance_ratio', centrifuge_maintenance_ratio,
+        )
+        self.centrifuge_labor_slope = self._require_nonnegative(
+            'centrifuge_labor_slope', centrifuge_labor_slope,
+        )
+        self.centrifuge_labor_intercept = self._require_nonnegative(
+            'centrifuge_labor_intercept', centrifuge_labor_intercept,
+        )
 
     @staticmethod
     def _require_positive(name, value):
         if value <= 0:
             raise ValueError(f'`{name}` must be positive.')
+        return value
+
+    @staticmethod
+    def _require_nonnegative(name, value):
+        if value < 0:
+            raise ValueError(f'`{name}` must be non-negative.')
         return value
 
     @property
@@ -1270,6 +1555,17 @@ class AlgaeCentrifuge(su.Splitter):
     def vgm(self, value):
         self._vgm = self._require_positive('vgm', value)
 
+    @property
+    def UF_flow(self):
+        return self._UF_flow
+
+    @UF_flow.setter
+    def UF_flow(self, value):
+        self._UF_flow = (
+            None if value is None
+            else self._require_nonnegative('UF_flow', value)
+        )
+
     def _get_mu(self):
         # Source: same viscosity relationship used in Ultrafiltration.
         return 497e-3 / (self.T + 42.5)**1.5
@@ -1280,6 +1576,32 @@ class AlgaeCentrifuge(su.Splitter):
         return (
             (self.algal_particle_density - self.water_density)
             * self.algal_cell_diameter**2 * 9.8 / (18 * mu)
+        )
+
+    def _get_labor_flow(self):
+        if self.UF_flow is not None:
+            return self.UF_flow
+        return self.ins[0].get_total_flow('m3/d')
+
+    def _calc_replacement_cost(self):
+        # Centrifuge maintenance source:
+        # https://doi.org/10.1016/j.algal.2017.11.038.
+        return _annual_to_hourly_cost(
+            self.centrifuge_maintenance_ratio * _installed_capital(self)
+        )
+
+    def _calc_maintenance_labor_cost(self):
+        Q = self._get_labor_flow()
+        _warn_if_flow_outside_NEIWPCC(self, Q, 'centrifuge')
+        # Labor source: NEIWPCC Northeast Staffing Guide,
+        # https://neiwpcc.org/wp-content/uploads/2020/08/NEIWPCC-Northeast-Staffing-Guide.pdf.
+        hours_per_unit = (
+            self.centrifuge_labor_slope * Q
+            + self.centrifuge_labor_intercept if Q > 0 else 0.
+        )
+        N = self.design_results.get('Number of centrifuges', 0)
+        return _annual_to_hourly_cost(
+            hours_per_unit * N * self.labor_wage
         )
 
     def _design(self):
@@ -1328,6 +1650,10 @@ class AlgaeCentrifuge(su.Splitter):
             C['Centrifuge'] = 0.
         self.power_utility.rate = (
             D['Disc centrifuge energy intensity'] * Q_hr
+        )
+        self.add_OPEX['labor'] = self._calc_maintenance_labor_cost()
+        self.add_OPEX['maintenance and replacement'] = (
+            self._calc_replacement_cost()
         )
 
 @cost(basis = 'Aerial footage-volume-to-area ratio', ID='Glass tube & fittings', units='m3/m2',
@@ -1380,6 +1706,30 @@ class Photobioreactor(CSTR):
         The average winter days per year that requires heaters, default to 150 days.
     heater_up_time_ratio: float
         The average daily up time ratio [0-1] of heaters, default to 0.15.
+    labor_wage : float
+        Labor wage in [USD/hr].
+    glass_tube_lifetime : float
+        Glass tube lifetime. The default is 30 [yr].
+    greenhouse_maintenance_ratio : float
+        Annual greenhouse maintenance cost as a fraction of installed capital.
+        The default is 0.016 [1/yr].
+    LED_lifetime : float
+        LED system lifetime. The default is 12 [yr].
+    support_structure_maintenance_ratio : float
+        Annual support-structure maintenance cost as a fraction of installed
+        capital. The default is 0.016 [1/yr].
+    PBR_labor_staff : float
+        Staff count basis in the PBR labor equation. The default is 91
+        [person].
+    PBR_labor_hours_per_staff : float
+        Annual labor hours per staff member in the PBR labor equation. The
+        default is 2000 [hr/person/yr].
+    PBR_labor_reference_volume : float
+        Reference tube working volume in the PBR labor equation. The default
+        is 349000 [m3].
+    PBR_labor_scaling_exponent : float
+        Scaling exponent in the PBR labor equation. The default is 0.6
+        [dimensionless].
     ===============================
     V_max : float
         Designed volume, in [m^3]. The default is 1000.
@@ -1442,6 +1792,15 @@ class Photobioreactor(CSTR):
                 heater_up_time_ratio = 0.15,
                 rho = 1000,
                 include_construction= True,
+                labor_wage=0.,
+                glass_tube_lifetime=30.,
+                greenhouse_maintenance_ratio=0.016,
+                LED_lifetime=12.,
+                support_structure_maintenance_ratio=0.016,
+                PBR_labor_staff=91.,
+                PBR_labor_hours_per_staff=2000.,
+                PBR_labor_reference_volume=349000.,
+                PBR_labor_scaling_exponent=0.6,
                 **kwargs):
         CSTR.__init__(self,ID=ID,ins=ins,outs=outs,split=None,V_max=V_max, W_tank = W_tank, D_tank = D_tank,
                 freeboard = freeboard, t_wall = t_wall, t_slab = t_slab, aeration=aeration, 
@@ -1463,6 +1822,32 @@ class Photobioreactor(CSTR):
         self.annual_heating_days = annual_heating_days
         self.heater_up_time_ratio = heater_up_time_ratio
         self.rho = rho
+        self.labor_wage = _require_nonnegative('labor_wage', labor_wage)
+        self.glass_tube_lifetime = _require_nonnegative(
+            'glass_tube_lifetime', glass_tube_lifetime,
+        )
+        self.greenhouse_maintenance_ratio = _require_nonnegative(
+            'greenhouse_maintenance_ratio', greenhouse_maintenance_ratio,
+        )
+        self.LED_lifetime = _require_nonnegative(
+            'LED_lifetime', LED_lifetime,
+        )
+        self.support_structure_maintenance_ratio = _require_nonnegative(
+            'support_structure_maintenance_ratio',
+            support_structure_maintenance_ratio,
+        )
+        self.PBR_labor_staff = _require_nonnegative(
+            'PBR_labor_staff', PBR_labor_staff,
+        )
+        self.PBR_labor_hours_per_staff = _require_nonnegative(
+            'PBR_labor_hours_per_staff', PBR_labor_hours_per_staff,
+        )
+        self.PBR_labor_reference_volume = _require_positive(
+            'PBR_labor_reference_volume', PBR_labor_reference_volume,
+        )
+        self.PBR_labor_scaling_exponent = _require_nonnegative(
+            'PBR_labor_scaling_exponent', PBR_labor_scaling_exponent,
+        )
     
     def _init_lca(self):#TODO
         self.include_construction = True
@@ -1575,6 +1960,54 @@ class Photobioreactor(CSTR):
         inf, RAA=self.ins
         eff, = self.outs
 
+    def _cost(self):
+        self._decorated_cost()
+        self.add_OPEX['labor'] = self._calc_maintenance_labor_cost()
+        self.add_OPEX['maintenance and replacement'] = (
+            self._calc_replacement_cost()
+        )
+
+    def _calc_replacement_cost(self):
+        # Glass tube lifetime source:
+        # https://www.algaefoundationatec.org/aces/download/Techno-Economic%20Analysis.pdf.
+        # Greenhouse/support annual maintenance source:
+        # https://extension.msstate.edu/sites/default/files/publications/P2766.pdf.
+        # LED lifetime source: Clearas documentation.
+        annual = 0.
+        if self.glass_tube_lifetime:
+            annual += (
+                _installed_capital(
+                    self, ('Glass tube & fittings',),
+                    include_parallel=False,
+                ) / self.glass_tube_lifetime
+            )
+        annual += self.greenhouse_maintenance_ratio * _installed_capital(
+            self, ('Greenhouse',), include_parallel=False,
+        )
+        if self.LED_lifetime:
+            annual += (
+                _installed_capital(
+                    self, ('LED system',), include_parallel=False,
+                ) / self.LED_lifetime
+            )
+        annual += self.support_structure_maintenance_ratio * _installed_capital(
+            self, ('Support structure',), include_parallel=False,
+        )
+        return _annual_to_hourly_cost(annual)
+
+    def _calc_maintenance_labor_cost(self):
+        # Labor source: Table 8 in
+        # https://www.algaefoundationatec.org/aces/download/Techno-Economic%20Analysis.pdf.
+        V = self.design_results.get('Working volume', 0.)
+        hours = (
+            self.PBR_labor_staff
+            * self.PBR_labor_hours_per_staff
+            * (V / self.PBR_labor_reference_volume)
+            ** self.PBR_labor_scaling_exponent
+            if V > 0 else 0.
+        )
+        return _annual_to_hourly_cost(hours * self.labor_wage)
+
 #%%
 class Ecorecoverypump(WWTpump):
     '''
@@ -1619,6 +2052,12 @@ class Ecorecoverypump(WWTpump):
     N_ubends : int or None
         Number of U-bends per PBR set. If None, it is estimated as
         number of rows per set minus 1.
+    labor_wage : float
+        Labor wage in [USD/hr].
+    pump_lifetime : float
+        Pump replacement lifetime. The default is 15 [yr].
+    pump_labor_hours : float
+        Annual labor requirement per pump. The default is 10 [hr/pump/yr].
     '''
     _valid_pump_types = WWTpump._valid_pump_types + ('feed_PBR',)
     _ft_to_m = auom('ft').conversion_factor('m')
@@ -1659,6 +2098,9 @@ class Ecorecoverypump(WWTpump):
                  include_OM_cost=False,
                  F_BM=default_F_BM,
                  lifetime=default_equipment_lifetime,
+                 labor_wage=0.,
+                 pump_lifetime=15.,
+                 pump_labor_hours=10.,
                  **kwargs):
 
         super().__init__(
@@ -1688,6 +2130,13 @@ class Ecorecoverypump(WWTpump):
         self.feed_PBR_H_p = H_p
         self.feed_PBR_L_s = 10 * self._m_to_ft if L_s is None else L_s
         self.feed_PBR_N_ubends = N_ubends
+        self.labor_wage = _require_nonnegative('labor_wage', labor_wage)
+        self.pump_lifetime = _require_positive(
+            'pump_lifetime', pump_lifetime,
+        )
+        self.pump_labor_hours = _require_nonnegative(
+            'pump_labor_hours', pump_labor_hours,
+        )
 
     @property
     def pump_type(self):
@@ -1915,3 +2364,30 @@ class Ecorecoverypump(WWTpump):
         M_SS_pump = N_pump * self.SS_per_pump                       # [kg]
 
         return M_SS_pipe, M_SS_pump, 0.
+
+    def _cost(self):
+        super()._cost()
+        self.add_OPEX['labor'] = self._calc_maintenance_labor_cost()
+        self.add_OPEX['maintenance and replacement'] = (
+            self._calc_replacement_cost()
+        )
+
+    def _calc_replacement_cost(self):
+        # Pump lifetime is user-settable; default is 15 yr.
+        pump_keys = tuple(
+            k for k in self.baseline_purchase_costs
+            if 'ump' in k and 'building' not in k
+        )
+        return _annual_to_hourly_cost(
+            _installed_capital(self, pump_keys, include_parallel=False)
+            / self.pump_lifetime
+        )
+
+    def _calc_maintenance_labor_cost(self):
+        # Labor source: NEIWPCC Northeast Staffing Guide,
+        # https://neiwpcc.org/wp-content/uploads/2020/08/NEIWPCC-Northeast-Staffing-Guide.pdf.
+        return _annual_to_hourly_cost(
+            self.pump_labor_hours
+            * getattr(self, 'N_pump', 0)
+            * self.labor_wage
+        )
