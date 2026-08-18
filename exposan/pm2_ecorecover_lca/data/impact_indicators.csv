@@ -1,0 +1,3 @@
+indicator,alias,unit,method,category,description
+GlobalWarming,GWP,kg CO2-eq,TRACI,environmental impact,Potential global warming based on chemical's radiative forcing and lifetime
+Eutrophication,Eut,kg N-eq,TRACI,environmental impact,Estimate how much a product or process contributes to nutrient pollution
